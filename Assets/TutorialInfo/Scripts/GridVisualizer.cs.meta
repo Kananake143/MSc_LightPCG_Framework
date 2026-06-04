@@ -1,0 +1,15 @@
+fileFormatVersion: 2
+guid: a6384745c46db4448ad866449b41239f
+MonoImporter:
+  externalObjects: {}
+  serializedVersion: 2
+  defaultReferences:
+  - emptyTilePrefab: {fileID: 2628894850650518270, guid: ee759c9519a7a2d4e9e97bb28afd2596, type: 3}
+  - wallPrefab: {fileID: 2628894850650518270, guid: 383b1acfcdb0fa34e80b0f29490c06f1, type: 3}
+  - emitterPrefab: {fileID: 2628894850650518270, guid: 9ae43e432be6538468f3a93487c1bf47, type: 3}
+  - receiverPrefab: {fileID: 2628894850650518270, guid: 06baf8e0f76ebfb4cb3d2be7177a0315, type: 3}
+  executionOrder: 0
+  icon: {instanceID: 0}
+  userData: 
+  assetBundleName: 
+  assetBundleVariant: 
