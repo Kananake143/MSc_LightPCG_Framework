@@ -33,12 +33,12 @@ namespace LightPCG.Systems
         private static readonly Color CMirror = new Color(0.65f, 0.88f, 1.00f);
         private static readonly Color CDoor = new Color(0.10f, 0.85f, 0.25f);
         private static readonly Color CRefractor = new Color(0.80f, 0.40f, 1.00f);
-
-        private const float EE = 1.8f, ER = 1.8f, ED = 0.6f, ERf = 1.2f;
+        private const float EE = 1.8f, ER = 1.8f, ED = 1.0f, ERf = 1.2f;
 
         [HideInInspector] public GridModel LevelGrid;
         [HideInInspector] public float Spacing => spacing;
-        public Dictionary<Vector2Int, GameObject> SpawnedObjects = new Dictionary<Vector2Int, GameObject>();
+        public Dictionary<Vector2Int, GameObject> SpawnedObjects
+            = new Dictionary<Vector2Int, GameObject>();
 
         void Start() => GenerateLevel();
 
@@ -46,11 +46,9 @@ namespace LightPCG.Systems
         {
             foreach (Transform c in transform) Destroy(c.gameObject);
             SpawnedObjects.Clear();
-
             LevelGrid = new GridModel(desiredWidth, desiredHeight);
             int steps = Random.Range(minSteps, maxSteps + 1);
             new BackwardChainingGenerator(LevelGrid).GenerateValidPuzzle(steps, emitterCount);
-
             BuildVisuals();
             Debug.Log($"[GridVisualizer] Level ready — {steps} bends, {emitterCount} emitter(s).");
         }
@@ -71,15 +69,15 @@ namespace LightPCG.Systems
                 for (int y = 0; y < LevelGrid.Height; y++)
                 {
                     TileType t = LevelGrid.GetTile(x, y);
-                    Vector3 basePos = new Vector3((x * spacing) - ox, 0, (y * spacing) - oz);
+                    Vector3 basePos = new Vector3((x * spacing) - ox, 0f, (y * spacing) - oz);
 
-                    // Floor
+                    // Floor always
                     if (emptyTilePrefab != null)
                     {
                         var fl = Instantiate(emptyTilePrefab, basePos, Quaternion.identity, transform);
                         fl.transform.localScale = new Vector3(1f, 0.1f, 1f);
                         ApplyColor(fl, CFloor);
-                        EnsureCollider(fl, isTrigger: false);
+                        EnsureCollider(fl);
                     }
 
                     if (t == TileType.Empty) continue;
@@ -87,17 +85,18 @@ namespace LightPCG.Systems
                     GameObject prefab = GetPrefab(t);
                     if (prefab == null) continue;
 
-                    // ── Rotation per type ─────────────────────────────────────
                     Quaternion rot = Quaternion.identity;
                     if (t == TileType.Mirror)
                         rot = Quaternion.Euler(0f, 45f, 0f);
                     else if (t == TileType.Emitter)
-                        rot = EmitterRotation(x, y);   // ← face INWARD toward grid
+                        rot = EmitterFacingRot(x, y);
+                    else if (t == TileType.Receiver)
+                        rot = ReceiverFacingRot(x, y); // face inward to "receive" laser
 
                     var obj = Instantiate(prefab, basePos + Vector3.up * 0.5f, rot, transform);
-                    SetScale(obj, t);
+                    obj.transform.localScale = GetScale(t);
                     ColorObject(obj, t);
-                    EnsureCollider(obj, isTrigger: false);
+                    EnsureCollider(obj);
                     TrySetTag(obj, GetTag(t));
 
                     if (t != TileType.Wall)
@@ -105,32 +104,36 @@ namespace LightPCG.Systems
                 }
         }
 
-        // ── Emitter faces the first empty neighbour (inward) ─────────────────
-        Quaternion EmitterRotation(int ex, int ey)
+        // Emitter: flush against nearest wall, fires INWARD
+        Quaternion EmitterFacingRot(int ex, int ey)
         {
-            Vector2Int[] dirs = {
-                Vector2Int.right, Vector2Int.left,
-                new Vector2Int(0,1), new Vector2Int(0,-1)
-            };
-            foreach (var d in dirs)
-            {
-                int nx = ex + d.x, ny = ey + d.y;
-                if (nx < 0 || nx >= LevelGrid.Width || ny < 0 || ny >= LevelGrid.Height) continue;
-                TileType t = LevelGrid.GetTile(nx, ny);
-                if (t != TileType.Wall && t != TileType.Door)
-                {
-                    // Rotate so transform.forward points toward (d.x, 0, d.y)
-                    return Quaternion.LookRotation(new Vector3(d.x, 0, d.y));
-                }
-            }
-            return Quaternion.identity;
+            int dL = ex, dR = LevelGrid.Width - 1 - ex;
+            int dB = ey, dT = LevelGrid.Height - 1 - ey;
+            int m = Mathf.Min(dL, dR, dB, dT);
+            if (m == dL) return Quaternion.LookRotation(Vector3.right);
+            if (m == dR) return Quaternion.LookRotation(Vector3.left);
+            if (m == dB) return Quaternion.LookRotation(Vector3.forward);
+            return Quaternion.LookRotation(Vector3.back);
         }
 
-        // ── Helpers ───────────────────────────────────────────────────────────
+        // Receiver: on a wall tile, face INWARD so its "sensor face" points into the room
+        Quaternion ReceiverFacingRot(int rx, int ry)
+        {
+            // Same logic as emitter — face away from nearest wall
+            int dL = rx, dR = LevelGrid.Width - 1 - rx;
+            int dB = ry, dT = LevelGrid.Height - 1 - ry;
+            int m = Mathf.Min(dL, dR, dB, dT);
+            if (m == dL) return Quaternion.LookRotation(Vector3.right);
+            if (m == dR) return Quaternion.LookRotation(Vector3.left);
+            if (m == dB) return Quaternion.LookRotation(Vector3.forward);
+            return Quaternion.LookRotation(Vector3.back);
+        }
+
+        //  Helpers 
         void TrySetTag(GameObject obj, string tag)
         {
             try { obj.tag = tag; }
-            catch { Debug.LogWarning($"[GridVisualizer] Tag '{tag}' missing. Add in Project Settings → Tags."); }
+            catch { Debug.LogWarning($"[GridVisualizer] Tag '{tag}' missing — add in Project Settings → Tags."); }
         }
 
         GameObject GetPrefab(TileType t)
@@ -161,15 +164,16 @@ namespace LightPCG.Systems
             }
         }
 
-        void SetScale(GameObject obj, TileType t)
+        Vector3 GetScale(TileType t)
         {
             switch (t)
             {
-                case TileType.Wall: obj.transform.localScale = new Vector3(1.1f, 3.0f, 1.1f); break;
-                case TileType.Mirror: obj.transform.localScale = new Vector3(0.5f, 2.0f, 1.2f); break;
-                case TileType.Receiver: obj.transform.localScale = new Vector3(1.3f, 1.3f, 1.3f); break;
-                case TileType.Door: obj.transform.localScale = new Vector3(0.3f, 2.5f, 1.0f); break;
-                default: obj.transform.localScale = Vector3.one; break;
+                case TileType.Wall: return new Vector3(1.1f, 3.0f, 1.1f);
+                case TileType.Emitter: return new Vector3(0.9f, 0.9f, 0.9f); // compact cube, flush against wall
+                case TileType.Mirror: return new Vector3(0.5f, 2.0f, 1.2f);
+                case TileType.Receiver: return new Vector3(0.9f, 0.9f, 0.9f); // compact cube on wall beside door
+                case TileType.Door: return new Vector3(0.3f, 2.5f, 1.0f);
+                default: return Vector3.one;
             }
         }
 
@@ -186,11 +190,10 @@ namespace LightPCG.Systems
             }
         }
 
-        void EnsureCollider(GameObject obj, bool isTrigger)
+        void EnsureCollider(GameObject obj)
         {
-            var col = obj.GetComponentInChildren<Collider>();
-            if (col == null) col = obj.AddComponent<BoxCollider>();
-            col.isTrigger = isTrigger;
+            if (obj.GetComponentInChildren<Collider>() == null)
+                obj.AddComponent<BoxCollider>();
         }
 
         void ApplyColor(GameObject obj, Color c)
