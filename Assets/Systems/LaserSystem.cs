@@ -5,9 +5,10 @@ namespace LightPCG.Systems
 {
     /// <summary>
     /// Attach ONLY to Emitter GameObjects.
-    /// Fires laser along transform.forward each frame.
-    /// Handles Mirror (reflection) and Refractor (90° deflection).
-    /// When laser hits Receiver -> destroys Door -> player can pass.
+    /// - Fires laser along transform.forward each frame
+    /// - Notifies ReceiverDetector on the Receiver object when hit
+    /// - Does NOT open the door directly — ReceiverDetector handles that
+    ///   so the door only opens when the laser is CONTINUOUSLY hitting the Receiver
     /// </summary>
     [RequireComponent(typeof(LineRenderer))]
     public class LaserSystem : MonoBehaviour
@@ -19,11 +20,14 @@ namespace LightPCG.Systems
 
         [Header("Visual")]
         public float lineWidth = 0.04f;
-        public Color laserColor = new Color(1f, 0.92f, 0.016f); // bright yellow
+        public Color laserColor = new Color(1f, 0.92f, 0.016f);
 
         private LineRenderer lr;
         private List<Vector3> pts = new List<Vector3>();
-        private bool solved = false;
+
+        // Track whether this laser is currently hitting a receiver
+        // (checked every frame — door only opens when this stays true)
+        public bool IsHittingReceiver { get; private set; }
 
         void Start()
         {
@@ -37,15 +41,16 @@ namespace LightPCG.Systems
 
         void Update()
         {
-            if (!solved) TraceLaser();
+            TraceLaser();
         }
 
         void TraceLaser()
         {
             pts.Clear();
-            Vector3 pos = transform.position;
-            Vector3 dir = transform.forward; // Emitter faces inward from GridVisualizer
+            IsHittingReceiver = false;  // reset every frame
 
+            Vector3 pos = transform.position;
+            Vector3 dir = transform.forward;
             pts.Add(pos);
 
             for (int b = 0; b < maxBounces; b++)
@@ -62,13 +67,11 @@ namespace LightPCG.Systems
 
                 if (tag == "Mirror")
                 {
-                    // Law of reflection: angle in = angle out
                     dir = Vector3.Reflect(dir, hit.normal);
                     pos = hit.point + dir * 0.02f;
                 }
                 else if (tag == "Refractor")
                 {
-                    // 90° deflection perpendicular to hit surface normal on XZ plane
                     Vector3 right = Vector3.Cross(Vector3.up, hit.normal).normalized;
                     float dot = Vector3.Dot(dir, right);
                     dir = (dot >= 0 ? right : -right);
@@ -76,16 +79,15 @@ namespace LightPCG.Systems
                 }
                 else if (tag == "Receiver")
                 {
-                    // Laser reached the receiver — puzzle solved!
-                    solved = true;
-                    Debug.Log("[LaserSystem] ✓ Receiver hit — puzzle solved!");
-                    OpenDoor();
+                    // Mark as hitting — ReceiverDetector component on the Receiver
+                    // will open the door when it confirms a sustained hit
+                    IsHittingReceiver = true;
+                    hit.collider.GetComponent<ReceiverDetector>()?.OnLaserHit();
                     break;
                 }
                 else
                 {
-                    // Wall or untagged → stop laser here
-                    break;
+                    break; // wall or untagged
                 }
             }
 
@@ -93,25 +95,6 @@ namespace LightPCG.Systems
             lr.SetPositions(pts.ToArray());
         }
 
-        void OpenDoor()
-        {
-            // Find and destroy the door to let the player through
-            GameObject door = GameObject.FindWithTag("Door");
-            if (door != null)
-            {
-                Destroy(door);
-                Debug.Log("[LaserSystem] Door destroyed — exit open!");
-            }
-            else
-            {
-                Debug.LogWarning("[LaserSystem] Door not found — check Tag 'Door' is defined.");
-            }
-        }
-
-        // Allow resetting (e.g. for next level)
-        public void ResetLaser()
-        {
-            solved = false;
-        }
+        public void ResetLaser() { /* no longer needed but kept for API compat */ }
     }
 }
