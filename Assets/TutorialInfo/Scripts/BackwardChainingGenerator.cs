@@ -4,113 +4,165 @@ using System.Collections.Generic;
 namespace LightPCG.Core
 {
     /// <summary>
-    /// v12 — Maze-style interior obstacles placed AFTER solution path is fixed,
-    /// so they never block the guaranteed laser route.
+    /// v14 — Pillar-based maze obstacles
+    /// Obstacles are single-cell pillars only (no L-shapes or long segments)
+    /// → guarantees no dead zones, always walkable around each pillar
+    /// → placed with strict radius-2 buffer from all solution cells
+    /// → placed with radius-1 buffer from each other (no clusters)
     /// </summary>
     public class BackwardChainingGenerator
     {
         private GridModel grid;
         private int W, H;
-
-        // Store solution path cells so obstacles never block them
         private HashSet<Vector2Int> solutionCells = new HashSet<Vector2Int>();
+        private HashSet<Vector2Int> pillarCells = new HashSet<Vector2Int>();
+
+        public int SolutionObjectCount { get; private set; }
+        public int DecoyCount { get; private set; }
+        public int TotalObjectCount => SolutionObjectCount + DecoyCount;
 
         public BackwardChainingGenerator(GridModel g)
         { grid = g; W = g.Width; H = g.Height; }
 
-        public void GenerateValidPuzzle(int steps, int emitterCount = 1)
+        public void GenerateValidPuzzle(int steps, int emitterCount = 1, int decoys = 1)
         {
             grid.ClearGrid();
             solutionCells.Clear();
+            pillarCells.Clear();
+            SolutionObjectCount = 0; DecoyCount = 0;
 
             // 1. Outer walls
-            for (int x = 0; x < W; x++)
-                for (int y = 0; y < H; y++)
-                    if (x == 0 || x == W - 1 || y == 0 || y == H - 1)
-                        grid.SetTile(x, y, TileType.Wall);
+            for (int x = 0; x < W; x++) for (int y = 0; y < H; y++)
+                    if (x == 0 || x == W - 1 || y == 0 || y == H - 1) grid.SetTile(x, y, TileType.Wall);
 
             // 2. Door + Receiver
             Vector2Int door = RandomSafeWallCell();
             grid.SetTile(door.x, door.y, TileType.Door);
             Vector2Int recv = ReceiverNearDoor(door);
             grid.SetTile(recv.x, recv.y, TileType.Receiver);
-            solutionCells.Add(recv);
-            solutionCells.Add(door);
+            solutionCells.Add(recv); solutionCells.Add(door);
 
-            // 3. Main chain — record all cells used
-            BuildChain(recv, Mathf.Max(steps, 3));
+            // 3. Main chain
+            BuildChain(recv, Mathf.Max(steps, 2));
 
             // 4. Extra emitters
             for (int e = 1; e < emitterCount; e++)
             {
-                Vector2Int start = RandomInnerEmpty();
-                if (start != -Vector2Int.one)
-                    BuildChain(start, Mathf.Max(3, steps - 1));
+                var s = RandomInnerEmpty();
+                if (s != -Vector2Int.one) BuildChain(s, Mathf.Max(2, steps - 1));
             }
 
-            // 5. Decoy objects (NOT on solution cells)
-            int decoys = Mathf.Clamp(steps - 1, 2, 5);
+            // 5. Decoys
             PlaceDecoys(decoys);
+            DecoyCount = decoys;
 
-            // 6. Maze walls — placed LAST, never on solution cells
-            PlaceMazeObstacles(steps);
+            // 6. Pillar obstacles — single cells, well-separated, never on solution
+            PlacePillars(steps);
 
-            Debug.Log($"[PCG] door@{door} recv@{recv} steps={steps} solutionCells={solutionCells.Count}");
+            Debug.Log($"[PCG] door@{door} recv@{recv} steps={steps} " +
+                      $"solutionObjs={SolutionObjectCount} decoys={DecoyCount}");
         }
 
-       
-        // MAZE OBSTACLES — placed after solution path is recorded
-        // Uses corridor-style segments to create a maze feel
-        
-        void PlaceMazeObstacles(int steps)
+        // ════════════════════════════════════════════════════════════════
+        // PILLAR OBSTACLES
+        // Single-cell walls, scattered randomly, never adjacent to solution
+        // Always leave a walkable path around them (pillar ≠ wall line)
+        // ════════════════════════════════════════════════════════════════
+        void PlacePillars(int steps)
         {
-            int attempts = Mathf.Clamp(steps * 3, 6, 20);
+            // Number of pillars scales with difficulty but stays moderate
+            int targetPillars = Mathf.Clamp(steps * 2, 3, 10);
+            int attempts = targetPillars * 15;
 
-            for (int a = 0; a < attempts * 5 && attempts > 0; a++)
+            for (int a = 0; a < attempts && targetPillars > 0; a++)
             {
-                int cx = Random.Range(3, W - 3);
-                int cy = Random.Range(3, H - 3);
-                if (IsOnSolutionPath(cx, cy, radius: 1)) continue;
+                int px = Random.Range(2, W - 2);
+                int py = Random.Range(2, H - 2);
 
-                // Short wall segment (1-3 cells)
-                bool horizontal = (Random.value > 0.5f);
-                int length = Random.Range(1, 4);
-                bool canPlace = true;
+                // Must be empty
+                if (grid.GetTile(px, py) != TileType.Empty) continue;
 
-                // Pre-check: none of the cells overlap solution path
-                for (int i = 0; i < length; i++)
-                {
-                    int nx = horizontal ? cx + i : cx;
-                    int ny = horizontal ? cy : cy + i;
-                    if (nx <= 1 || nx >= W - 2 || ny <= 1 || ny >= H - 2) { canPlace = false; break; }
-                    if (IsOnSolutionPath(nx, ny, radius: 1)) { canPlace = false; break; }
-                    if (grid.GetTile(nx, ny) != TileType.Empty) { canPlace = false; break; }
-                }
+                // Must not be on or adjacent to solution path (radius 2)
+                if (IsOnSolutionPath(px, py, 2)) continue;
 
-                if (!canPlace) continue;
+                // Must not be adjacent to another pillar (keep pillars separated)
+                if (IsAdjacentToPillar(px, py)) continue;
 
-                for (int i = 0; i < length; i++)
-                {
-                    int nx = horizontal ? cx + i : cx;
-                    int ny = horizontal ? cy : cy + i;
-                    grid.SetTile(nx, ny, TileType.Wall);
-                }
-                attempts--;
+                // Must not create a 2x2 wall block (would create dead zone)
+                if (Would2x2Block(px, py)) continue;
+
+                // Must not completely block a corridor (check all 4 neighbours remain passable)
+                if (WouldBlockCorridor(px, py)) continue;
+
+                grid.SetTile(px, py, TileType.Wall);
+                pillarCells.Add(new Vector2Int(px, py));
+                targetPillars--;
             }
         }
 
-        bool IsOnSolutionPath(int x, int y, int radius = 0)
+        bool IsAdjacentToPillar(int x, int y)
         {
-            for (int dx = -radius; dx <= radius; dx++)
-                for (int dy = -radius; dy <= radius; dy++)
-                    if (solutionCells.Contains(new Vector2Int(x + dx, y + dy)))
-                        return true;
+            int[] dx = { 0, 0, 1, -1 };
+            int[] dy = { 1, -1, 0, 0 };
+            for (int i = 0; i < 4; i++)
+                if (pillarCells.Contains(new Vector2Int(x + dx[i], y + dy[i]))) return true;
             return false;
         }
 
-        
+        bool Would2x2Block(int x, int y)
+        {
+            // Check if placing a wall here would form a 2x2 wall block
+            int[,] corners = { { 0, 0 }, { 1, 0 }, { 0, 1 }, { 1, 1 } };
+            for (int cx = x - 1; cx <= x; cx++)
+                for (int cy = y - 1; cy <= y; cy++)
+                {
+                    bool allWall = true;
+                    for (int i = 0; i < 4; i++)
+                    {
+                        int nx = cx + corners[i, 0], ny = cy + corners[i, 1];
+                        if (nx == x && ny == y) continue; // the new pillar
+                        if (nx < 0 || nx >= W || ny < 0 || ny >= H) { allWall = false; break; }
+                        TileType t = grid.GetTile(nx, ny);
+                        if (t != TileType.Wall) { allWall = false; break; }
+                    }
+                    if (allWall) return true;
+                }
+            return false;
+        }
+
+        bool WouldBlockCorridor(int x, int y)
+        {
+            // A pillar blocks a corridor if it's in a 1-cell wide passage
+            // Check: horizontal passage blocked (both N and S are walls/pillars)
+            bool nWall = IsWallOrEdge(x, y + 1);
+            bool sWall = IsWallOrEdge(x, y - 1);
+            bool eWall = IsWallOrEdge(x + 1, y);
+            bool wWall = IsWallOrEdge(x - 1, y);
+
+            // Would completely block horizontal or vertical passage
+            if (nWall && sWall) return true;
+            if (eWall && wWall) return true;
+            return false;
+        }
+
+        bool IsWallOrEdge(int x, int y)
+        {
+            if (x < 0 || x >= W || y < 0 || y >= H) return true;
+            TileType t = grid.GetTile(x, y);
+            return t == TileType.Wall;
+        }
+
+        bool IsOnSolutionPath(int x, int y, int radius)
+        {
+            for (int dx = -radius; dx <= radius; dx++)
+                for (int dy = -radius; dy <= radius; dy++)
+                    if (solutionCells.Contains(new Vector2Int(x + dx, y + dy))) return true;
+            return false;
+        }
+
+        // ════════════════════════════════════════════════════════════════
         // CHAIN BUILDER
-        
+        // ════════════════════════════════════════════════════════════════
         void BuildChain(Vector2Int chainStart, int steps)
         {
             int cx = chainStart.x, cy = chainStart.y;
@@ -129,11 +181,12 @@ namespace LightPCG.Core
 
                 if (i < steps - 1)
                 {
-                    TileType bend = (Random.value > 0.35f) ? TileType.Mirror : TileType.Refractor;
+                    TileType bend = (Random.value > 0.4f) ? TileType.Mirror : TileType.Refractor;
                     if (grid.GetTile(cx, cy) == TileType.Empty)
                     {
                         grid.SetTile(cx, cy, bend);
                         solutionCells.Add(new Vector2Int(cx, cy));
+                        SolutionObjectCount++;
                     }
                     dir = Rotate90(dir);
                 }
@@ -143,7 +196,7 @@ namespace LightPCG.Core
 
         void PlaceDecoys(int count)
         {
-            for (int i = 0; i < count * 10 && count > 0; i++)
+            for (int i = 0; i < count * 20 && count > 0; i++)
             {
                 int x = Random.Range(2, W - 2), y = Random.Range(2, H - 2);
                 if (grid.GetTile(x, y) != TileType.Empty) continue;
@@ -172,7 +225,8 @@ namespace LightPCG.Core
                     }
                     return;
                 }
-                if (grid.GetTile(nx, ny) == TileType.Empty) { cx = nx; cy = ny; solutionCells.Add(new Vector2Int(cx, cy)); }
+                if (grid.GetTile(nx, ny) == TileType.Empty)
+                { cx = nx; cy = ny; solutionCells.Add(new Vector2Int(cx, cy)); }
                 else
                 {
                     if (grid.GetTile(cx, cy) == TileType.Empty && !IsCornerZone(cx, cy))
@@ -184,7 +238,7 @@ namespace LightPCG.Core
             { grid.SetTile(cx, cy, TileType.Emitter); solutionCells.Add(new Vector2Int(cx, cy)); }
         }
 
-        //  Helpers
+        // ── Helpers ───────────────────────────────────────────────────
         Vector2Int ReceiverNearDoor(Vector2Int door)
         {
             Vector2Int inDir = InwardDirFromWall(door), inner = door + inDir;
@@ -203,10 +257,8 @@ namespace LightPCG.Core
 
         Vector2Int InwardDirFromWall(Vector2Int w)
         {
-            if (w.x == 0) return Vector2Int.right;
-            if (w.x == W - 1) return Vector2Int.left;
-            if (w.y == 0) return new Vector2Int(0, 1);
-            return new Vector2Int(0, -1);
+            if (w.x == 0) return Vector2Int.right; if (w.x == W - 1) return Vector2Int.left;
+            if (w.y == 0) return new Vector2Int(0, 1); return new Vector2Int(0, -1);
         }
 
         Vector2Int RandomSafeWallCell()
@@ -222,14 +274,23 @@ namespace LightPCG.Core
 
         Vector2Int FindSafeInnerEdgeEmpty()
         {
-            for (int x = 3; x < W - 3; x++) { if (grid.GetTile(x, 1) == TileType.Empty) return new Vector2Int(x, 1); if (grid.GetTile(x, H - 2) == TileType.Empty) return new Vector2Int(x, H - 2); }
-            for (int y = 3; y < H - 3; y++) { if (grid.GetTile(1, y) == TileType.Empty) return new Vector2Int(1, y); if (grid.GetTile(W - 2, y) == TileType.Empty) return new Vector2Int(W - 2, y); }
+            for (int x = 3; x < W - 3; x++)
+            {
+                if (grid.GetTile(x, 1) == TileType.Empty) return new Vector2Int(x, 1);
+                if (grid.GetTile(x, H - 2) == TileType.Empty) return new Vector2Int(x, H - 2);
+            }
+            for (int y = 3; y < H - 3; y++)
+            {
+                if (grid.GetTile(1, y) == TileType.Empty) return new Vector2Int(1, y);
+                if (grid.GetTile(W - 2, y) == TileType.Empty) return new Vector2Int(W - 2, y);
+            }
             return -Vector2Int.one;
         }
 
         Vector2Int RandomInwardDir(int x, int y)
         {
-            var dirs = new List<Vector2Int> { Vector2Int.right, Vector2Int.left, new Vector2Int(0, 1), new Vector2Int(0, -1) };
+            var dirs = new List<Vector2Int>{Vector2Int.right,Vector2Int.left,
+              new Vector2Int(0,1),new Vector2Int(0,-1)};
             for (int i = dirs.Count - 1; i > 0; i--) { int j = Random.Range(0, i + 1); var t = dirs[i]; dirs[i] = dirs[j]; dirs[j] = t; }
             foreach (var d in dirs) { int nx = x + d.x * 2, ny = y + d.y * 2; if (nx > 1 && nx < W - 2 && ny > 1 && ny < H - 2) return d; }
             return dirs[0];
@@ -237,10 +298,15 @@ namespace LightPCG.Core
 
         Vector2Int RandomInnerEmpty()
         {
-            for (int a = 0; a < 100; a++) { int x = Random.Range(2, W - 2), y = Random.Range(2, H - 2); if (grid.GetTile(x, y) == TileType.Empty) return new Vector2Int(x, y); }
+            for (int a = 0; a < 100; a++)
+            {
+                int x = Random.Range(2, W - 2), y = Random.Range(2, H - 2);
+                if (grid.GetTile(x, y) == TileType.Empty) return new Vector2Int(x, y);
+            }
             return -Vector2Int.one;
         }
 
-        Vector2Int Rotate90(Vector2Int d) => (Random.value > 0.5f) ? new Vector2Int(-d.y, d.x) : new Vector2Int(d.y, -d.x);
+        Vector2Int Rotate90(Vector2Int d) => (Random.value > 0.5f)
+            ? new Vector2Int(-d.y, d.x) : new Vector2Int(d.y, -d.x);
     }
 }

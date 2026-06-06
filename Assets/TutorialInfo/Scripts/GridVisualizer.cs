@@ -12,9 +12,12 @@ namespace LightPCG.Systems
         public float spacing = 1.1f;
 
         [Header("Difficulty")]
-        [Range(3, 10)] public int minSteps = 4;
-        [Range(4, 12)] public int maxSteps = 7;
+        [Range(2, 8)] public int minSteps = 3;
+        [Range(3, 10)] public int maxSteps = 6;
         [Range(1, 3)] public int emitterCount = 1;
+
+        [Header("Decoy Objects")]
+        [Range(0, 4)] public int decoyCount = 1;
 
         [Header("Prefabs")]
         public GameObject emptyTilePrefab;
@@ -25,23 +28,25 @@ namespace LightPCG.Systems
         public GameObject doorPrefab;
         public GameObject refractorPrefab;
 
-        //  Colours 
-        private static readonly Color CFloor = new Color(0.78f, 0.74f, 0.68f); // warm stone
-        private static readonly Color CWall = new Color(0.22f, 0.28f, 0.35f); // dark slate blue
-        private static readonly Color CEmitter = new Color(1.00f, 0.85f, 0.10f); // golden yellow
-        private static readonly Color CReceiver = new Color(0.90f, 0.15f, 0.10f); // vivid red
-        private static readonly Color CMirror = new Color(0.88f, 0.96f, 1.00f); // near-white ice blue
-        private static readonly Color CDoor = new Color(0.10f, 0.85f, 0.25f); // bright green
-        private static readonly Color CRefractor = new Color(0.45f, 0.05f, 0.80f); // deep violet
-        // Interior obstacle walls: slightly lighter than outer wall
-        private static readonly Color CWallInner = new Color(0.32f, 0.38f, 0.45f); // medium slate
-
+        // Colours
+        private static readonly Color CFloor = new Color(0.78f, 0.74f, 0.68f);
+        private static readonly Color CWall = new Color(0.22f, 0.28f, 0.35f);
+        private static readonly Color CWallInner = new Color(0.35f, 0.42f, 0.50f); // lighter for maze pillars
+        private static readonly Color CEmitter = new Color(1.00f, 0.85f, 0.10f);
+        private static readonly Color CReceiver = new Color(0.90f, 0.15f, 0.10f);
+        private static readonly Color CMirror = new Color(0.88f, 0.96f, 1.00f);
+        private static readonly Color CDoor = new Color(0.10f, 0.85f, 0.25f);
+        private static readonly Color CRefractor = new Color(0.45f, 0.05f, 0.80f);
         private const float EE = 1.8f, ER = 1.8f, ED = 1.0f, ERf = 2.2f, EMirror = 0.5f;
 
         [HideInInspector] public GridModel LevelGrid;
         [HideInInspector] public float Spacing => spacing;
-        public Dictionary<Vector2Int, GameObject> SpawnedObjects
-            = new Dictionary<Vector2Int, GameObject>();
+        public Dictionary<Vector2Int, GameObject> SpawnedObjects = new Dictionary<Vector2Int, GameObject>();
+
+        [HideInInspector] public int LastSolutionObjectCount;
+        [HideInInspector] public int LastDecoyCount;
+        [HideInInspector] public int LastTotalObjectCount;
+        [HideInInspector] public int LastSteps;
 
         void Start() => GenerateLevel();
 
@@ -50,10 +55,15 @@ namespace LightPCG.Systems
             foreach (Transform c in transform) Destroy(c.gameObject);
             SpawnedObjects.Clear();
             LevelGrid = new GridModel(desiredWidth, desiredHeight);
-            int steps = Random.Range(minSteps, maxSteps + 1);
-            new BackwardChainingGenerator(LevelGrid).GenerateValidPuzzle(steps, emitterCount);
+            LastSteps = Random.Range(minSteps, maxSteps + 1);
+            var pcg = new BackwardChainingGenerator(LevelGrid);
+            pcg.GenerateValidPuzzle(LastSteps, emitterCount, decoyCount);
+            LastSolutionObjectCount = pcg.SolutionObjectCount;
+            LastDecoyCount = pcg.DecoyCount;
+            LastTotalObjectCount = pcg.TotalObjectCount;
             BuildVisuals();
-            Debug.Log($"[GridVisualizer] Level ready — {steps} bends, {emitterCount} emitter(s).");
+            Debug.Log($"[GridVisualizer] Level ready — steps={LastSteps} " +
+                      $"solutionObjs={LastSolutionObjectCount} decoys={LastDecoyCount}");
         }
 
         public Vector3 GridToWorld(int x, int y)
@@ -65,7 +75,6 @@ namespace LightPCG.Systems
         void BuildVisuals()
         {
             float ox = (LevelGrid.Width - 1) * spacing / 2f, oz = (LevelGrid.Height - 1) * spacing / 2f;
-
             for (int x = 0; x < LevelGrid.Width; x++)
                 for (int y = 0; y < LevelGrid.Height; y++)
                 {
@@ -77,8 +86,7 @@ namespace LightPCG.Systems
                     {
                         var fl = Instantiate(emptyTilePrefab, base3, Quaternion.identity, transform);
                         fl.transform.localScale = new Vector3(1f, 0.1f, 1f);
-                        ApplyColor(fl, CFloor);
-                        EnsureCollider(fl);
+                        ApplyColor(fl, CFloor); EnsureCollider(fl);
                     }
 
                     if (t == TileType.Empty) continue;
@@ -102,14 +110,11 @@ namespace LightPCG.Systems
                 }
         }
 
-        bool IsOuterWall(int x, int y) =>
-            (x == 0 || x == LevelGrid.Width - 1 || y == 0 || y == LevelGrid.Height - 1);
+        bool IsOuterWall(int x, int y) => x == 0 || x == LevelGrid.Width - 1 || y == 0 || y == LevelGrid.Height - 1;
 
-        //  Rotations 
         Quaternion EmitterFacingRot(int ex, int ey)
         {
-            int dL = ex, dR = LevelGrid.Width - 1 - ex, dB = ey, dT = LevelGrid.Height - 1 - ey;
-            int m = Mathf.Min(dL, dR, dB, dT);
+            int dL = ex, dR = LevelGrid.Width - 1 - ex, dB = ey, dT = LevelGrid.Height - 1 - ey, m = Mathf.Min(dL, dR, dB, dT);
             if (m == dL) return Quaternion.LookRotation(Vector3.right);
             if (m == dR) return Quaternion.LookRotation(Vector3.left);
             if (m == dB) return Quaternion.LookRotation(Vector3.forward);
@@ -118,8 +123,7 @@ namespace LightPCG.Systems
 
         Quaternion ReceiverFacingRot(int rx, int ry)
         {
-            int dL = rx, dR = LevelGrid.Width - 1 - rx, dB = ry, dT = LevelGrid.Height - 1 - ry;
-            int m = Mathf.Min(dL, dR, dB, dT);
+            int dL = rx, dR = LevelGrid.Width - 1 - rx, dB = ry, dT = LevelGrid.Height - 1 - ry, m = Mathf.Min(dL, dR, dB, dT);
             if (m == dL) return Quaternion.LookRotation(Vector3.right);
             if (m == dR) return Quaternion.LookRotation(Vector3.left);
             if (m == dB) return Quaternion.LookRotation(Vector3.forward);
@@ -128,18 +132,12 @@ namespace LightPCG.Systems
 
         Quaternion DoorFacingRot(int dx, int dy)
         {
-            bool onTopBot = (dy == 0 || dy == LevelGrid.Height - 1);
-            return onTopBot
-                ? Quaternion.Euler(0f, 0f, 0f)
-                : Quaternion.Euler(0f, 90f, 0f);
+            bool tb = (dy == 0 || dy == LevelGrid.Height - 1);
+            return tb ? Quaternion.Euler(0f, 0f, 0f) : Quaternion.Euler(0f, 90f, 0f);
         }
 
-        //  Helpers
         void TrySetTag(GameObject obj, string tag)
-        {
-            try { obj.tag = tag; }
-            catch { Debug.LogWarning($"[GridVisualizer] Tag '{tag}' missing."); }
-        }
+        { try { obj.tag = tag; } catch { Debug.LogWarning($"[GridVisualizer] Tag '{tag}' missing."); } }
 
         GameObject GetPrefab(TileType t)
         {
@@ -175,29 +173,30 @@ namespace LightPCG.Systems
             {
                 case TileType.Wall: return new Vector3(1.1f, 3.0f, 1.1f);
                 case TileType.Emitter: return new Vector3(0.9f, 0.9f, 0.9f);
-                case TileType.Mirror: return new Vector3(0.1f, 2.0f, 1.0f);  // very thin glassy panel
-                case TileType.Refractor: return new Vector3(0.8f, 1.6f, 0.8f);  // chunky prism
+                // Mirror: very thin panel — laser hits flat face cleanly
+                case TileType.Mirror: return new Vector3(0.08f, 2.2f, 1.0f);
+                // Refractor: slim prism — narrow enough that laser hits correct face
+                // Width 0.3 ensures laser hits the front/back face, not a side face
+                case TileType.Refractor: return new Vector3(0.3f, 1.8f, 0.9f);
                 case TileType.Receiver: return new Vector3(0.9f, 0.9f, 0.9f);
-                case TileType.Door: return new Vector3(1.0f, 3.0f, 0.08f); // flush with wall
+                case TileType.Door: return new Vector3(1.0f, 3.0f, 0.08f);
                 default: return Vector3.one;
             }
         }
 
-        void ColorObject(GameObject obj, TileType t, bool isOuterWall = false)
+        void ColorObject(GameObject obj, TileType t, bool outer = false)
         {
             switch (t)
             {
                 case TileType.Wall:
-                    // Outer walls darker, inner maze walls lighter — visually distinct
-                    ApplyColor(obj, isOuterWall ? CWall : CWallInner);
-                    break;
+                    ApplyColor(obj, outer ? CWall : CWallInner); break;
                 case TileType.Emitter:
                     ApplyColor(obj, CEmitter); ApplyEmissive(obj, CEmitter, EE); break;
                 case TileType.Receiver:
                     ApplyColor(obj, CReceiver); ApplyEmissive(obj, CReceiver, ER); break;
                 case TileType.Mirror:
                     ApplyColor(obj, CMirror); ApplyEmissive(obj, CMirror, EMirror);
-                    SetTransparent(obj, 0.5f); break;
+                    SetTransparent(obj, 0.45f); break;
                 case TileType.Door:
                     ApplyColor(obj, CDoor); ApplyEmissive(obj, CDoor, ED); break;
                 case TileType.Refractor:
@@ -206,10 +205,7 @@ namespace LightPCG.Systems
         }
 
         void EnsureCollider(GameObject obj)
-        {
-            if (obj.GetComponentInChildren<Collider>() == null)
-                obj.AddComponent<BoxCollider>();
-        }
+        { if (obj.GetComponentInChildren<Collider>() == null) obj.AddComponent<BoxCollider>(); }
 
         void ApplyColor(GameObject obj, Color c)
         {
@@ -220,9 +216,9 @@ namespace LightPCG.Systems
             }
         }
 
-        void ApplyEmissive(GameObject obj, Color c, float intensity)
+        void ApplyEmissive(GameObject obj, Color c, float i)
         {
-            Color ec = c * Mathf.Pow(2f, intensity);
+            Color ec = c * Mathf.Pow(2f, i);
             foreach (var r in obj.GetComponentsInChildren<Renderer>())
             { var mat = r.material; mat.EnableKeyword("_EMISSION"); mat.SetColor("_EmissionColor", ec); }
         }
@@ -231,17 +227,11 @@ namespace LightPCG.Systems
         {
             foreach (var r in obj.GetComponentsInChildren<Renderer>())
             {
-                Material mat = r.material;
-                mat.SetFloat("_Surface", 1f);
-                mat.SetFloat("_Blend", 0f);
-                mat.SetFloat("_AlphaClip", 0f);
-                mat.EnableKeyword("_SURFACE_TYPE_TRANSPARENT");
-                mat.renderQueue = 3000;
-                Color c = mat.color; c.a = alpha; mat.color = c;
-                var mpb = new MaterialPropertyBlock();
-                r.GetPropertyBlock(mpb);
-                mpb.SetColor("_BaseColor", new Color(0.88f, 0.96f, 1f, alpha));
-                r.SetPropertyBlock(mpb);
+                var mat = r.material; mat.SetFloat("_Surface", 1f); mat.SetFloat("_Blend", 0f);
+                mat.SetFloat("_AlphaClip", 0f); mat.EnableKeyword("_SURFACE_TYPE_TRANSPARENT");
+                mat.renderQueue = 3000; Color c = mat.color; c.a = alpha; mat.color = c;
+                var mpb = new MaterialPropertyBlock(); r.GetPropertyBlock(mpb);
+                mpb.SetColor("_BaseColor", new Color(0.88f, 0.96f, 1f, alpha)); r.SetPropertyBlock(mpb);
             }
         }
     }
