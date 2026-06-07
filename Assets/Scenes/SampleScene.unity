@@ -505,6 +505,7 @@ GameObject:
   m_Component:
   - component: {fileID: 1581782428}
   - component: {fileID: 1581782427}
+  - component: {fileID: 1581782429}
   m_Layer: 0
   m_Name: _GridManager
   m_TagString: Untagged
@@ -530,6 +531,7 @@ MonoBehaviour:
   minSteps: 3
   maxSteps: 6
   emitterCount: 1
+  decoyCount: 1
   emptyTilePrefab: {fileID: 2628894850650518270, guid: ee759c9519a7a2d4e9e97bb28afd2596, type: 3}
   wallPrefab: {fileID: 2628894850650518270, guid: 383b1acfcdb0fa34e80b0f29490c06f1, type: 3}
   emitterPrefab: {fileID: 2628894850650518270, guid: 9ae43e432be6538468f3a93487c1bf47, type: 3}
@@ -537,6 +539,10 @@ MonoBehaviour:
   mirrorPrefab: {fileID: 2628894850650518270, guid: 52cedb932d4490045b4057d3cbb58bbd, type: 3}
   doorPrefab: {fileID: 2628894850650518270, guid: 31801596b3528a24bb5100434713e41a, type: 3}
   refractorPrefab: {fileID: 7603299237096001433, guid: 8285b071a401ad44da3bcf55e86e37d4, type: 3}
+  LastSolutionObjectCount: 0
+  LastDecoyCount: 0
+  LastTotalObjectCount: 0
+  LastSteps: 0
 --- !u!4 &1581782428
 Transform:
   m_ObjectHideFlags: 0
@@ -552,6 +558,23 @@ Transform:
   m_Children: []
   m_Father: {fileID: 0}
   m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
+--- !u!114 &1581782429
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1581782426}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 6dda6ad5de5e7be45b99d5f8f79e549a, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  totalRuns: 1000
+  runOnStart: 1
+  gridVisualizer: {fileID: 0}
+  solverAgent: {fileID: 0}
+  csvFileName: PCG_Results.csv
 --- !u!1 &1901820493
 GameObject:
   m_ObjectHideFlags: 0
@@ -566,6 +589,7 @@ GameObject:
   - component: {fileID: 1901820494}
   - component: {fileID: 1901820498}
   - component: {fileID: 1901820499}
+  - component: {fileID: 1901820500}
   m_Layer: 0
   m_Name: AI_Agent
   m_TagString: Untagged
@@ -679,8 +703,13 @@ MonoBehaviour:
   gridVisualizer: {fileID: 1581782427}
   moveSpeed: 4
   rotationSpeed: 5
+  physicsWait: 0.15
   stepDelay: 0.25
-  pickupDelay: 0.15
+  maxBacktrackRounds: 5
+  WasSolved: 0
+  SolveIterations: 0
+  SolveTimeMs: 0
+  TotalPlacements: 0
 --- !u!143 &1901820499
 CharacterController:
   m_ObjectHideFlags: 0
@@ -706,6 +735,23 @@ CharacterController:
   m_SkinWidth: 0.08
   m_MinMoveDistance: 0.001
   m_Center: {x: 0, y: 0.5, z: 0}
+--- !u!114 &1901820500
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 1901820493}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 6dda6ad5de5e7be45b99d5f8f79e549a, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  totalRuns: 1000
+  runOnStart: 1
+  gridVisualizer: {fileID: 0}
+  solverAgent: {fileID: 0}
+  csvFileName: PCG_Results.csv
 --- !u!1660057539 &9223372036854775807
 SceneRoots:
   m_ObjectHideFlags: 0

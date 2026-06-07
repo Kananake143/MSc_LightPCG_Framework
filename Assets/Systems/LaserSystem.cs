@@ -70,11 +70,17 @@ namespace LightPCG.Systems
                 }
                 else if (tag == "Refractor")
                 {
-                    // ── Refractor: use object's transform.forward, NOT hit.normal ──
-                    // hit.normal on a thin prism's edge is unreliable.
-                    // Instead we derive the deflection plane from the object's own axes.
-                    dir = ComputeRefractorDeflection(dir, hit.collider.transform);
-                    pos = hit.point + dir * 0.02f;
+                    float yRot = Mathf.DeltaAngle(0f, hit.collider.transform.eulerAngles.y);
+                    if (Mathf.Abs(yRot) > 5f)
+                    {
+                        dir = ComputeRefractorDeflection(dir, hit.collider.transform);
+                        pos = hit.point + dir * 0.02f;
+                    }
+                    else
+                    {
+                        
+                        pos = hit.point + dir * 0.02f;
+                    }
                 }
                 else if (tag == "Receiver")
                 {
