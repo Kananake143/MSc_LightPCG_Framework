@@ -21,6 +21,7 @@ namespace LightPCG.Systems
 
         [Header("Limits")]
         public int maxBacktrackRounds = 5;
+        public int maxIterations = 50;
 
         [HideInInspector] public bool WasSolved;
         [HideInInspector] public int SolveIterations;
@@ -188,7 +189,8 @@ namespace LightPCG.Systems
             Debug.Log("[AI] Phase 4 BACKTRACK");
             var receiver = FindFirst(TileType.Receiver);
 
-            for (int round = 0; round < maxBacktrackRounds && !RealSolved(); round++)
+            for (int round = 0; round < maxBacktrackRounds && !RealSolved()
+    && SolveIterations < maxIterations; round++)
             {
                 SolveIterations++;
                 Debug.Log($"[AI] Backtrack round {round + 1}");
@@ -486,8 +488,12 @@ namespace LightPCG.Systems
         {
             if (allLasers == null || allLasers.Length == 0)
                 allLasers = FindObjectsByType<LaserSystem>(FindObjectsSortMode.None);
-            foreach (var l in allLasers) if (l != null && l.IsHittingReceiver) return true;
-            return false;
+            
+            int hitting = 0;
+            foreach (var l in allLasers)
+                if (l != null && l.IsHittingReceiver) hitting++;
+            
+            return hitting > 0 && hitting >= allLasers.Length;
         }
 
         Vector2Int GridBounce(Vector2Int d, Vector2Int cell)
