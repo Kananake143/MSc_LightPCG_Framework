@@ -158,7 +158,8 @@ namespace LightPCG.Systems
 
                 BeamState beam = ObserveBeam();
                 var cells = PrioritisedCells(beam, receiver);
-
+                int maxDist = Mathf.Max(grid.Width, grid.Height) / 2;
+                cells = cells.FindAll(c => Manhattan(c, receiver) <= maxDist);
                 foreach (var targetCell in cells)
                 {
                     if (RealSolved()) break;
@@ -172,7 +173,8 @@ namespace LightPCG.Systems
 
                     yield return StartCoroutine(WalkTo(targetCell));
 
-                    int prevLen = BeamLength();
+                    // FIX: คำนวณ prevScore BEFORE วางวัตถุ
+                    int prevScore = ScoreBeam(receiver);
                     bool cellKept = false;
 
                     foreach (int rot in PrioritisedRotations(objType, targetCell, receiver))
@@ -193,10 +195,10 @@ namespace LightPCG.Systems
                             yield break;
                         }
 
-                        if (BeamLength() > prevLen)
+                        // FIX: เปรียบเทียบ score ใหม่ vs score เก่า (ก่อนวาง)
+                        if (ScoreBeam(receiver) > prevScore)
                         {
-                            Debug.Log($"[AI] Keep {objType}@{targetCell} rot {rot}deg " +
-                                      $"beam {prevLen}->{BeamLength()}");
+                            Debug.Log($"[AI] Keep {objType}@{targetCell} rot {rot}deg");
                             cellKept = true;
                             go = null;
                             break;
@@ -223,6 +225,15 @@ namespace LightPCG.Systems
 
             if (!RealSolved())
                 yield return StartCoroutine(Phase4_Backtrack());
+        }
+
+        // FIX: ย้าย ScoreBeam ออกมาเป็น method ของ class (ไม่ใช่ local function)
+        int ScoreBeam(Vector2Int receiver)
+        {
+            if (RealSolved()) return int.MaxValue;
+            var b = ObserveBeam();
+            int distToReceiver = Manhattan(b.endCell, receiver);
+            return b.pathLength - distToReceiver * 2;
         }
 
         // ════════════════════════════════════════════════════════════
@@ -479,7 +490,20 @@ namespace LightPCG.Systems
         }
 
         int BeamLength() => ObserveBeam().pathLength;
+        BeamState SimulateBeamWithout(Vector2Int excludeCell)
+        {
+            // ชั่วคราว: เอา object ออกจาก grid
+            TileType savedType = grid.GetTile(excludeCell.x, excludeCell.y);
+            grid.SetTile(excludeCell.x, excludeCell.y, TileType.Empty);
 
+            // simulate beam โดยไม่มี object นั้น
+            BeamState result = ObserveBeam();
+
+            // คืนค่าเดิม
+            grid.SetTile(excludeCell.x, excludeCell.y, savedType);
+
+            return result;
+        }
         // ════════════════════════════════════════════════════════════
         // SELECTION HELPERS
         // ════════════════════════════════════════════════════════════
@@ -489,17 +513,52 @@ namespace LightPCG.Systems
             sorted.Sort((a, b) => Manhattan(a, receiver).CompareTo(Manhattan(b, receiver)));
             var result = new List<Vector2Int>();
             foreach (var c in sorted) if (!IsExhausted(c)) result.Add(c);
+
+            // FIX: fallback ไม่ใช้ทุก empty cell
+            // ใช้เฉพาะ cell ที่อยู่ในแนว beam หรือใกล้ receiver เท่านั้น
             if (result.Count == 0)
             {
+                // หา cells ที่อยู่ใน row หรือ column เดียวกับ beam endpoint
+                Vector2Int endCell = beam.endCell;
+                Vector2Int recvCell = receiver;
+
                 for (int x = 1; x < grid.Width - 1; x++)
                     for (int y = 1; y < grid.Height - 1; y++)
                     {
+                        if (grid.GetTile(x, y) != TileType.Empty) continue;
                         var v = new Vector2Int(x, y);
-                        if (grid.GetTile(x, y) == TileType.Empty && !result.Contains(v))
+
+                        // รับเฉพาะ cell ที่:
+                        // อยู่ใน row/col เดียวกับ beam endpoint
+                        // หรืออยู่ใน row/col เดียวกับ receiver
+                        bool onBeamRow = (y == endCell.y);
+                        bool onBeamCol = (x == endCell.x);
+                        bool onRecvRow = (y == recvCell.y);
+                        bool onRecvCol = (x == recvCell.x);
+
+                        if ((onBeamRow || onBeamCol || onRecvRow || onRecvCol)
+                            && !IsExhausted(v))
+                            result.Add(v);
+                    }
+
+                result.Sort((a, b) => Manhattan(a, receiver).CompareTo(Manhattan(b, receiver)));
+            }
+
+            // ถ้ายังว่างอีก → จำกัดแค่ Manhattan distance ≤ threshold จาก receiver
+            if (result.Count == 0)
+            {
+                int threshold = Mathf.Max(grid.Width, grid.Height) / 2;
+                for (int x = 1; x < grid.Width - 1; x++)
+                    for (int y = 1; y < grid.Height - 1; y++)
+                    {
+                        if (grid.GetTile(x, y) != TileType.Empty) continue;
+                        var v = new Vector2Int(x, y);
+                        if (Manhattan(v, receiver) <= threshold && !IsExhausted(v))
                             result.Add(v);
                     }
                 result.Sort((a, b) => Manhattan(a, receiver).CompareTo(Manhattan(b, receiver)));
             }
+
             return result;
         }
 
@@ -507,8 +566,27 @@ namespace LightPCG.Systems
         {
             var list = GetInteractables();
             if (list.Count == 0) return -Vector2Int.one;
-            list.Sort((a, b) => Manhattan(b, receiver).CompareTo(Manhattan(a, receiver)));
-            return list[0];
+
+            var beam = ObserveBeam();
+
+            // แยก: object ที่อยู่บน beam path vs ไม่อยู่
+            var onBeam = new List<Vector2Int>();
+            var offBeam = new List<Vector2Int>();
+            foreach (var obj in list)
+            {
+                // ถ้า object อยู่ใน path ของ beam ปัจจุบัน = "useful"
+                bool isUseful = false;
+                var tempBeam = SimulateBeamWithout(obj); // simulate ถ้าไม่มี obj นี้
+                if (tempBeam.pathLength < beam.pathLength) isUseful = true;
+
+                if (isUseful) onBeam.Add(obj);
+                else offBeam.Add(obj);
+            }
+
+            // ย้าย offBeam ก่อน (ไม่ได้ใช้งาน), ถ้าไม่มีค่อยย้าย onBeam
+            var candidates = offBeam.Count > 0 ? offBeam : onBeam;
+            candidates.Sort((a, b) => Manhattan(b, receiver).CompareTo(Manhattan(a, receiver)));
+            return candidates[0];
         }
 
         List<int> PrioritisedRotations(TileType t, Vector2Int cell, Vector2Int receiver)

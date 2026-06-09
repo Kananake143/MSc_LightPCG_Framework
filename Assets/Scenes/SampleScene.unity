@@ -538,7 +538,7 @@ MonoBehaviour:
   receiverPrefab: {fileID: 2628894850650518270, guid: 06baf8e0f76ebfb4cb3d2be7177a0315, type: 3}
   mirrorPrefab: {fileID: 2628894850650518270, guid: 52cedb932d4490045b4057d3cbb58bbd, type: 3}
   doorPrefab: {fileID: 2628894850650518270, guid: 31801596b3528a24bb5100434713e41a, type: 3}
-  refractorPrefab: {fileID: 7603299237096001433, guid: 8285b071a401ad44da3bcf55e86e37d4, type: 3}
+  refractorPrefab: {fileID: 0}
   LastSolutionObjectCount: 0
   LastDecoyCount: 0
   LastTotalObjectCount: 0
@@ -595,7 +595,7 @@ GameObject:
   - component: {fileID: 1901820498}
   - component: {fileID: 1901820499}
   - component: {fileID: 1901820500}
-  m_Layer: 0
+  m_Layer: 7
   m_Name: AI_Agent
   m_TagString: Untagged
   m_Icon: {fileID: 0}
@@ -619,7 +619,7 @@ CapsuleCollider:
   m_LayerOverridePriority: 0
   m_IsTrigger: 0
   m_ProvidesContacts: 0
-  m_Enabled: 1
+  m_Enabled: 0
   serializedVersion: 2
   m_Radius: 0.5
   m_Height: 2

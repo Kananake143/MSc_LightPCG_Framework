@@ -202,6 +202,7 @@ namespace LightPCG.Core
                 if (grid.GetTile(x, y) != TileType.Empty) continue;
                 if (IsCornerZone(x, y)) continue;
                 if (solutionCells.Contains(new Vector2Int(x, y))) continue;
+                if (IsOnSolutionPath(x, y, 1)) continue;
                 grid.SetTile(x, y, (Random.value > 0.5f) ? TileType.Mirror : TileType.Refractor);
                 count--;
             }

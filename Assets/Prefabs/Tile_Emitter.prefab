@@ -233,6 +233,6 @@ MonoBehaviour:
   maxBounces: 5
   obstacleLayer:
     serializedVersion: 2
-    m_Bits: 4294967295
+    m_Bits: 119
   lineWidth: 0.05
   laserColor: {r: 1, g: 0.92156863, b: 0.015686275, a: 1}

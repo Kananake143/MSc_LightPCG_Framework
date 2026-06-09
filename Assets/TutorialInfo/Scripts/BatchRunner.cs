@@ -1,4 +1,4 @@
-using UnityEngine;
+﻿using UnityEngine;
 using System.Collections;
 using System.Collections.Generic;
 using System.IO;
@@ -42,7 +42,9 @@ namespace LightPCG.Research
         {
             public int run, level, steps, solObjs, decoys, totalObjs, iters, placements;
             public bool solved;
-            public float solMs, genMs;
+            public float solMs, genMs,mid;
+            public int gridWidth, gridHeight;   // เพิ่มบรรทัดนี้
+
         }
 
         void Start()
@@ -95,7 +97,9 @@ namespace LightPCG.Research
                 yield return new WaitForSeconds(exitDoorWait);
 
                 bool ok = solverAgent.WasSolved;
-
+                int gw = gridVisualizer.desiredWidth;
+                int gh = gridVisualizer.desiredHeight;
+                float mid = (float)gridVisualizer.LastSolutionObjectCount / (gw * gh);
                 records.Add(new RunRecord
                 {
                     run = currentRun,
@@ -108,7 +112,10 @@ namespace LightPCG.Research
                     iters = solverAgent.SolveIterations,
                     placements = solverAgent.TotalPlacements,
                     solMs = solverAgent.SolveTimeMs,
-                    genMs = gMs
+                    genMs = gMs,
+                    gridWidth = gw,      // เพิ่ม
+                    gridHeight = gh,      // เพิ่ม
+                    mid = mid      // เพิ่ม
                 });
 
                 if (ok)
@@ -138,14 +145,20 @@ namespace LightPCG.Research
         void ExportCSV()
         {
             var sb = new StringBuilder();
+            // เพิ่ม MID,GridWidth,GridHeight ใน header
             sb.AppendLine("Run,Level,Solved,Steps,SolutionObjects,Decoys," +
-                          "TotalObjects,Iterations,Placements,SolveTimeMs,GenerationTimeMs");
+                          "TotalObjects,Iterations,Placements,SolveTimeMs," +
+                          "GenerationTimeMs,MID,GridWidth,GridHeight");
+
             foreach (var r in records)
                 sb.AppendLine(
                     r.run + "," + r.level + "," + (r.solved ? 1 : 0) + "," +
                     r.steps + "," + r.solObjs + "," + r.decoys + "," +
                     r.totalObjs + "," + r.iters + "," + r.placements + "," +
-                    r.solMs.ToString("F2") + "," + r.genMs.ToString("F2"));
+                    r.solMs.ToString("F2") + "," + r.genMs.ToString("F2") + "," +
+                    r.mid.ToString("F4") + "," +    // เพิ่ม
+                    r.gridWidth + "," +              // เพิ่ม
+                    r.gridHeight);                   // เพิ่ม
 
             string path = Path.Combine(Application.dataPath, csvFileName);
             File.WriteAllText(path, sb.ToString());
