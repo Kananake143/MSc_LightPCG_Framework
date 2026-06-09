@@ -1,7 +1,7 @@
 ﻿using LightPCG.Core;
 using UnityEngine;
 using UnityEngine.AI;
-using Unity.AI.Navigation;
+
 using System.Collections.Generic;
 
 namespace LightPCG.Systems
@@ -52,6 +52,7 @@ namespace LightPCG.Systems
 
         void Start() => GenerateLevel();
 
+
         public void GenerateLevel()
         {
             foreach (Transform c in transform) Destroy(c.gameObject);
@@ -64,12 +65,6 @@ namespace LightPCG.Systems
             LastDecoyCount = pcg.DecoyCount;
             LastTotalObjectCount = pcg.TotalObjectCount;
             BuildVisuals();
-
-            // Rebake NavMesh ทุกครั้งที่ generate ด่านใหม่
-            var surface = GetComponent<NavMeshSurface>();
-            if (surface != null)
-                surface.BuildNavMesh();
-
             Debug.Log($"[GridVisualizer] Level ready steps={LastSteps} " +
                       $"solutionObjs={LastSolutionObjectCount} decoys={LastDecoyCount}");
         }

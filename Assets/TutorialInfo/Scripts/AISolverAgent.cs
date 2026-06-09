@@ -1,20 +1,19 @@
 ﻿using UnityEngine;
 using System.Collections;
 using System.Collections.Generic;
-using UnityEngine.AI;
 using LightPCG.Core;
 
 namespace LightPCG.Systems
 {
-    [RequireComponent(typeof(NavMeshAgent))]
+    [RequireComponent(typeof(CharacterController))]
     public class AISolverAgent : MonoBehaviour
     {
         [Header("References")]
         public GridVisualizer gridVisualizer;
 
         [Header("Movement")]
-        public float moveSpeed = 5f;
-        public float arrivalDist = 0.15f;
+        public float moveSpeed = 8f;
+        public float rotationSpeed = 15f;
 
         [Header("Timing")]
         public float physicsWait = 0.15f;
@@ -32,7 +31,7 @@ namespace LightPCG.Systems
 
         private GridModel grid;
         private float spacing;
-        private NavMeshAgent agent;
+        private CharacterController cc;
         private LaserSystem[] allLasers;
         private float solveStart;
         private bool running;
@@ -47,12 +46,11 @@ namespace LightPCG.Systems
 
         void Awake()
         {
-            agent = GetComponent<NavMeshAgent>();
-            agent.speed = moveSpeed;
-            agent.angularSpeed = 360f;
-            agent.acceleration = 20f;
-            agent.stoppingDistance = arrivalDist;
-            agent.autoBraking = true;
+            cc = GetComponent<CharacterController>();
+            cc.radius = 0.28f;
+            cc.height = 1.0f;
+            cc.center = new Vector3(0, 0.5f, 0);
+            cc.minMoveDistance = 0f;
         }
 
         void Start()
@@ -87,10 +85,9 @@ namespace LightPCG.Systems
             if (em == -Vector2Int.one)
             { Debug.LogError("[AI] No Emitter!"); Finish(false); yield break; }
 
-            agent.enabled = false;
+            cc.enabled = false;
             transform.position = gridVisualizer.GridToWorld(em.x, em.y);
-            yield return new WaitForEndOfFrame();
-            agent.enabled = true;
+            cc.enabled = true;
             yield return new WaitForSeconds(physicsWait);
 
             if (RealSolved())
@@ -107,7 +104,8 @@ namespace LightPCG.Systems
                 {
                     if (grid.GetTile(x, y) != TileType.Emitter) continue;
                     var cell = new Vector2Int(x, y);
-                    if (!gridVisualizer.SpawnedObjects.TryGetValue(cell, out var go) || go == null) continue;
+                    if (!gridVisualizer.SpawnedObjects.TryGetValue(cell, out var go) || go == null)
+                        continue;
                     var ls = go.GetComponent<LaserSystem>();
                     if (ls != null) list.Add(ls);
                 }
@@ -128,10 +126,9 @@ namespace LightPCG.Systems
             if (emitter == -Vector2Int.one || receiver == -Vector2Int.one)
             { Debug.LogError("[AI] Missing Emitter or Receiver!"); Finish(false); yield break; }
 
-            agent.enabled = false;
+            cc.enabled = false;
             transform.position = gridVisualizer.GridToWorld(emitter.x, emitter.y);
-            yield return new WaitForEndOfFrame();
-            agent.enabled = true;
+            cc.enabled = true;
             yield return new WaitForSeconds(physicsWait);
 
             if (RealSolved())
@@ -205,7 +202,8 @@ namespace LightPCG.Systems
                             break;
                         }
 
-                        if (gridVisualizer.SpawnedObjects.TryGetValue(targetCell, out var gR) && gR != null)
+                        if (gridVisualizer.SpawnedObjects.TryGetValue(targetCell, out var gR)
+                            && gR != null)
                             gR.transform.rotation = Quaternion.identity;
                     }
 
@@ -254,7 +252,8 @@ namespace LightPCG.Systems
                     {
                         if (WasTried(objCell, objCell, rot)) continue;
 
-                        if (gridVisualizer.SpawnedObjects.TryGetValue(objCell, out var go) && go != null)
+                        if (gridVisualizer.SpawnedObjects.TryGetValue(objCell, out var go)
+                            && go != null)
                             go.transform.rotation = Quaternion.Euler(0f, rot, 0f);
 
                         yield return new WaitForSeconds(physicsWait);
@@ -310,7 +309,8 @@ namespace LightPCG.Systems
 
                             if (BeamLength() > beam.pathLength) { relocated = true; break; }
 
-                            if (gridVisualizer.SpawnedObjects.TryGetValue(newTarget, out var gr) && gr != null)
+                            if (gridVisualizer.SpawnedObjects.TryGetValue(newTarget, out var gr)
+                                && gr != null)
                                 gr.transform.rotation = Quaternion.identity;
                         }
 
@@ -335,62 +335,61 @@ namespace LightPCG.Systems
         }
 
         // ════════════════════════════════════════════════════════════
-        // WALK TO — NavMeshAgent
+        // WALK TO — CharacterController + BFS
         // ════════════════════════════════════════════════════════════
         IEnumerator WalkTo(Vector2Int target)
         {
             if (target == -Vector2Int.one) yield break;
+            var path = BFS(WorldToGrid(transform.position), target);
+            if (path == null || path.Count == 0) yield break;
 
-            Vector3 worldDest = gridVisualizer.GridToWorld(target.x, target.y);
-
-            // ตรวจ NavMeshAgent active
-            if (!agent.isActiveAndEnabled)
+            foreach (var step in path)
             {
-                Debug.LogWarning("[AI] NavMeshAgent not active!");
-                yield break;
-            }
+                Vector3 wt = gridVisualizer.GridToWorld(step.x, step.y);
+                wt.y = transform.position.y;
+                float to = 5f;
 
-            // ตรวจว่า NavMesh มีจุดนั้นไหม
-            NavMeshHit nmHit;
-            if (!NavMesh.SamplePosition(worldDest, out nmHit, 2f, NavMesh.AllAreas))
-            {
-                Debug.LogWarning($"[AI] No NavMesh near {target} worldPos={worldDest}");
-                yield break;
-            }
-
-            agent.isStopped = false;
-            agent.SetDestination(nmHit.position);
-
-            // รอ 1 frame ให้ path เริ่มคำนวณ
-            yield return null;
-
-            float timeout = 10f;
-            while (timeout > 0f)
-            {
-                timeout -= Time.deltaTime;
-
-                if (agent.pathPending)
+                while (Vector3.Distance(transform.position, wt) > 0.1f && to > 0)
                 {
+                    to -= Time.deltaTime;
+                    var d = (wt - transform.position).normalized;
+                    if (d.sqrMagnitude > 0.001f)
+                        transform.rotation = Quaternion.Slerp(transform.rotation,
+                            Quaternion.LookRotation(d), rotationSpeed * Time.deltaTime);
+                    cc.Move(d * moveSpeed * Time.deltaTime + Vector3.down * 2f * Time.deltaTime);
                     yield return null;
-                    continue;
                 }
-
-                if (agent.remainingDistance <= agent.stoppingDistance)
-                    break;
-
-                if (agent.pathStatus == NavMeshPathStatus.PathInvalid)
-                {
-                    Debug.LogWarning($"[AI] Path invalid to {target}");
-                    break;
-                }
-
-                yield return null;
             }
+        }
 
-            if (timeout <= 0f)
-                Debug.LogWarning($"[AI] WalkTo timeout! target={target} remaining={agent.remainingDistance:F2}");
+        List<Vector2Int> BFS(Vector2Int start, Vector2Int goal)
+        {
+            if (start == goal) return new List<Vector2Int>();
+            var visited = new HashSet<Vector2Int> { start };
+            var parent = new Dictionary<Vector2Int, Vector2Int>();
+            var queue = new Queue<Vector2Int>();
+            queue.Enqueue(start);
 
-            agent.isStopped = true;
+            while (queue.Count > 0)
+            {
+                var cur = queue.Dequeue();
+                foreach (var d in Dirs4)
+                {
+                    var next = cur + d;
+                    if (visited.Contains(next)) continue;
+                    var t = grid.GetTile(next.x, next.y);
+                    if (t != TileType.Empty && t != TileType.Door && next != goal) continue;
+                    visited.Add(next); parent[next] = cur;
+                    if (next == goal)
+                    {
+                        var p = new List<Vector2Int>();
+                        for (var c = goal; c != start; c = parent[c]) p.Add(c);
+                        p.Reverse(); return p;
+                    }
+                    queue.Enqueue(next);
+                }
+            }
+            return null;
         }
 
         // ════════════════════════════════════════════════════════════
@@ -412,10 +411,15 @@ namespace LightPCG.Systems
 
                 Vector2Int beyond = dc + OutDir(dc);
                 Vector3 bw = gridVisualizer.GridToWorld(beyond.x, beyond.y);
-                agent.isStopped = false;
-                agent.SetDestination(bw);
-                yield return new WaitForSeconds(2f);
-                agent.isStopped = true;
+                float to = 3f;
+
+                while (Vector3.Distance(transform.position, bw) > 0.3f && to > 0)
+                {
+                    to -= Time.deltaTime;
+                    var d = (bw - transform.position).normalized;
+                    cc.Move(d * moveSpeed * Time.deltaTime + Vector3.down * 2f * Time.deltaTime);
+                    yield return null;
+                }
             }
 
             Debug.Log("[AI] Exited door!");
@@ -463,8 +467,10 @@ namespace LightPCG.Systems
                         s.endCell = pos;
 
                         var t = grid.GetTile(pos.x, pos.y);
-                        if (t == TileType.Empty && !s.emptyCells.Contains(pos)) s.emptyCells.Add(pos);
-                        if (t == TileType.Receiver || t == TileType.Wall || t == TileType.Emitter) break;
+                        if (t == TileType.Empty && !s.emptyCells.Contains(pos))
+                            s.emptyCells.Add(pos);
+                        if (t == TileType.Receiver || t == TileType.Wall || t == TileType.Emitter)
+                            break;
                         if (t == TileType.Mirror) { dir = GridBounce(dir, pos); continue; }
                         if (t == TileType.Refractor) { dir = GridRefract(dir, pos); continue; }
                     }
@@ -485,10 +491,12 @@ namespace LightPCG.Systems
             foreach (var c in sorted) if (!IsExhausted(c)) result.Add(c);
             if (result.Count == 0)
             {
-                for (int x = 1; x < grid.Width - 1; x++) for (int y = 1; y < grid.Height - 1; y++)
+                for (int x = 1; x < grid.Width - 1; x++)
+                    for (int y = 1; y < grid.Height - 1; y++)
                     {
                         var v = new Vector2Int(x, y);
-                        if (grid.GetTile(x, y) == TileType.Empty && !result.Contains(v)) result.Add(v);
+                        if (grid.GetTile(x, y) == TileType.Empty && !result.Contains(v))
+                            result.Add(v);
                     }
                 result.Sort((a, b) => Manhattan(a, receiver).CompareTo(Manhattan(b, receiver)));
             }
@@ -546,7 +554,8 @@ namespace LightPCG.Systems
         // ════════════════════════════════════════════════════════════
         void RememberTried(Vector2Int from, Vector2Int to, int rot)
         {
-            if (!memory.ContainsKey(from)) memory[from] = new HashSet<(Vector2Int, int)>();
+            if (!memory.ContainsKey(from))
+                memory[from] = new HashSet<(Vector2Int, int)>();
             memory[from].Add((to, rot));
         }
 
@@ -641,7 +650,8 @@ namespace LightPCG.Systems
             for (int x = 0; x < grid.Width; x++) for (int y = 0; y < grid.Height; y++)
                 {
                     var t = grid.GetTile(x, y);
-                    if (t == TileType.Mirror || t == TileType.Refractor) l.Add(new Vector2Int(x, y));
+                    if (t == TileType.Mirror || t == TileType.Refractor)
+                        l.Add(new Vector2Int(x, y));
                 }
             return l;
         }
