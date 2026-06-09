@@ -1,5 +1,7 @@
 ﻿using LightPCG.Core;
 using UnityEngine;
+using UnityEngine.AI;
+using Unity.AI.Navigation;
 using System.Collections.Generic;
 
 namespace LightPCG.Systems
@@ -62,7 +64,13 @@ namespace LightPCG.Systems
             LastDecoyCount = pcg.DecoyCount;
             LastTotalObjectCount = pcg.TotalObjectCount;
             BuildVisuals();
-            Debug.Log($"[GridVisualizer] Level ready — steps={LastSteps} " +
+
+            // Rebake NavMesh ทุกครั้งที่ generate ด่านใหม่
+            var surface = GetComponent<NavMeshSurface>();
+            if (surface != null)
+                surface.BuildNavMesh();
+
+            Debug.Log($"[GridVisualizer] Level ready steps={LastSteps} " +
                       $"solutionObjs={LastSolutionObjectCount} decoys={LastDecoyCount}");
         }
 
@@ -174,7 +182,7 @@ namespace LightPCG.Systems
                 case TileType.Wall: return new Vector3(1.1f, 3.0f, 1.1f);
                 case TileType.Emitter: return new Vector3(0.9f, 0.9f, 0.9f);
                 // Mirror: very thin panel — laser hits flat face cleanly
-                case TileType.Mirror: return new Vector3(0.08f, 2.2f, 1.0f);
+                case TileType.Mirror: return new Vector3(0.1f, 2.2f, 1.0f);
                 // Refractor: slim prism — narrow enough that laser hits correct face
                 // Width 0.3 ensures laser hits the front/back face, not a side face
                 case TileType.Refractor: return new Vector3(0.3f, 1.8f, 0.9f);

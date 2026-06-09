@@ -3,22 +3,14 @@ using System.Collections.Generic;
 
 namespace LightPCG.Systems
 {
-    /// <summary>
-    /// Attach ONLY to Emitter GameObjects.
-    /// 
-    /// Refractor fix:
-    ///   Instead of using hit.normal (unreliable on thin edges),
-    ///   we read the Refractor's transform.forward directly.
-    ///   The refractor deflects laser 90° perpendicular to its forward axis.
-    ///   This is consistent with the grid math in AISolverAgent.
-    /// </summary>
     [RequireComponent(typeof(LineRenderer))]
     public class LaserSystem : MonoBehaviour
     {
         [Header("Laser Settings")]
         public float maxLaserDistance = 50f;
         public int maxBounces = 10;
-        public LayerMask obstacleLayer;
+        [Tooltip("ตั้งเป็น Everything (-1) หรือ Layer ที่ puzzle objects อยู่")]
+        public LayerMask obstacleLayer = -1;
 
         [Header("Visual")]
         public float lineWidth = 0.04f;
@@ -26,7 +18,6 @@ namespace LightPCG.Systems
 
         private LineRenderer lr;
         private List<Vector3> pts = new List<Vector3>();
-
         public bool IsHittingReceiver { get; private set; }
 
         void Start()
@@ -37,6 +28,13 @@ namespace LightPCG.Systems
             lr.useWorldSpace = true;
             lr.material = new Material(Shader.Find("Unlit/Color")) { color = laserColor };
             lr.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+
+            // FIX Bug 2: If obstacleLayer = 0 (Nothing), the light will disappear.
+            if (obstacleLayer.value == 0)
+            {
+                obstacleLayer = ~0;
+                Debug.LogWarning("[LaserSystem] obstacleLayer=Nothing -> reset to Everything. " + "Please set the correct layer in Inspector");
+            }
         }
 
         void Update() => TraceLaser();
@@ -53,7 +51,12 @@ namespace LightPCG.Systems
             for (int b = 0; b < maxBounces; b++)
             {
                 RaycastHit hit;
-                if (!Physics.Raycast(pos, dir, out hit, maxLaserDistance, obstacleLayer))
+
+                // FIX Bug 3: Added QueryTriggerInteraction.Ignore to prevent trigger collider.
+                bool didHit = Physics.Raycast(pos, dir, out hit,
+                    maxLaserDistance, obstacleLayer, QueryTriggerInteraction.Ignore);
+
+                if (!didHit)
                 {
                     pts.Add(pos + dir * maxLaserDistance);
                     break;
@@ -64,23 +67,15 @@ namespace LightPCG.Systems
 
                 if (tag == "Mirror")
                 {
-                    // Standard physics reflection — mirror is flat so normal is reliable
+                    // Flat glass: hit.normal is always reliable.
                     dir = Vector3.Reflect(dir, hit.normal);
                     pos = hit.point + dir * 0.02f;
                 }
                 else if (tag == "Refractor")
                 {
-                    float yRot = Mathf.DeltaAngle(0f, hit.collider.transform.eulerAngles.y);
-                    if (Mathf.Abs(yRot) > 5f)
-                    {
-                        dir = ComputeRefractorDeflection(dir, hit.collider.transform);
-                        pos = hit.point + dir * 0.02f;
-                    }
-                    else
-                    {
-                        
-                        pos = hit.point + dir * 0.02f;
-                    }
+                    // Fix Bug 1: Check 3 layers before refraction.
+                    dir = HandleRefractor(dir, hit);
+                    pos = hit.point + dir * 0.02f;
                 }
                 else if (tag == "Receiver")
                 {
@@ -99,45 +94,85 @@ namespace LightPCG.Systems
         }
 
         /// <summary>
-        /// Computes the refracted direction based on the prism's orientation.
-        /// 
-        /// The prism has two flat faces (front/back = transform.forward plane).
-        /// When laser hits the front face it exits the side face — 90° turn.
-        /// The turn direction (left or right) depends on which side the laser
-        /// is coming from relative to the prism's right axis.
+        /// FIX Bug 1: Refractor - 3-Layer Check
         ///
-        ///   prism.forward = face normal (the flat face the laser hits)
-        ///   prism.right   = the axis along which the laser deflects
+        /// Layer 1 - Rotation gate:
+        /// |yRot| <= 5 deg -> Prism is not rotated -> Light passes straight through (pass-through)
         ///
-        /// Dot product of incoming dir with prism.right tells us which way to turn.
+        /// Layer 2 - Face validity:
+        /// dot(hit.normal, prism.forward) in the XZ plane
+        /// |dot| >= 0.5 (cos 60 deg) -> Hits a flat face -> Refraction
+        /// |dot| < 0.5 -> Hits an edge -> Light passes straight through
+        ///
+        /// Layer 3 - Direction gate:
+        /// dot(incomingDir, prism.forward) in the XZ plane
+        /// |dot| > 0.3 -> Light comes from a reasonable direction -> Refraction
+        /// |dot| <= 0.3 -> Light comes at too much of an angle -> Passes straight through
+        ///
+        /// Physics: Snell's law only applies to flat optical interfaces
+        /// Edges are not optical surfaces -> treat as transparent
         /// </summary>
-        Vector3 ComputeRefractorDeflection(Vector3 incomingDir, Transform prism)
+        Vector3 HandleRefractor(Vector3 inDir, RaycastHit hit)
         {
-            // Project incoming direction onto the prism's right axis (XZ plane only)
-            Vector3 prismRight = prism.right;
-            prismRight.y = 0f;
-            prismRight.Normalize();
+            Transform prism = hit.collider.transform;
 
-            Vector3 prismForward = prism.forward;
-            prismForward.y = 0f;
-            prismForward.Normalize();
+            // Layer 1: Rotation gate
+            float yRot = Mathf.DeltaAngle(0f, prism.eulerAngles.y);
+            if (Mathf.Abs(yRot) <= 5f)
+                return inDir; // ไม่ถูกหมุน -> ผ่านตรง
 
-            float dotRight = Vector3.Dot(incomingDir, prismRight);
-            float dotFwd = Vector3.Dot(incomingDir, prismForward);
+            // Layer 2: Face validity — dot(hit.normal, prism.forward) in XZ plane
+            Vector3 F = prism.forward; F.y = 0f;
+            if (F.sqrMagnitude < 0.001f) return inDir;
+            F.Normalize();
 
-            // Laser coming along prism.forward axis → deflect along prism.right
-            // Laser coming along prism.right axis  → deflect along prism.forward
-            // Choose dominant axis of incoming direction
-            if (Mathf.Abs(dotFwd) >= Mathf.Abs(dotRight))
-            {
-                // Incoming mainly along forward/back → exit through right or left side
-                return dotRight >= 0 ? prismRight : -prismRight;
-            }
+            Vector3 N = hit.normal; N.y = 0f;
+            if (N.sqrMagnitude < 0.001f) return inDir;
+            N.Normalize();
+
+            // cos(60 deg) = 0.5 -> if normal is more than 60 deg away from forward = ridge = straight through
+            float faceDot = Mathf.Abs(Vector3.Dot(N, F));
+            if (faceDot < 0.5f)
+                return inDir; // Edge -> Pass straight
+
+            // Layer 3: Direction gate — Checks if the light is coming from a reasonable direction.
+            Vector3 inDirXZ = new Vector3(inDir.x, 0f, inDir.z).normalized;
+            float dirDot = Mathf.Abs(Vector3.Dot(inDirXZ, F));
+            if (dirDot <= 0.3f)
+                return inDir; // แสงเฉียงเกินไป -> ผ่านตรง
+
+            // Passing through all layers: Calculate a 90-degree refraction.
+            return Deflect90(inDir, prism);
+        }
+
+        /// <summary>
+        /// Calculate 90-degree refraction direction
+        ///
+        /// Mathematics:
+        /// R = prism.right (XZ plane)
+        /// F = prism.forward (XZ plane)
+        ///
+        /// dR = dot(incomingDir, R) -> component along the right axis
+        /// dF = dot(incomingDir, F) -> component along the forward axis
+        ///
+        /// If |dF| >= |dR|: Light comes along the F axis -> refracts out towards R (or -R)
+        /// If |dR| > |dF|: Light comes along the R axis -> refracts out towards F (or -F)
+        ///
+        /// The sign of the resulting direction uses the sign of the smaller dot product
+        /// To maintain chirality of refraction
+        /// </summary>
+        Vector3 Deflect90(Vector3 inDir, Transform prism)
+        {
+            Vector3 R = prism.right; R.y = 0f; R.Normalize();
+            Vector3 F = prism.forward; F.y = 0f; F.Normalize();
+
+            float dR = Vector3.Dot(inDir, R);
+            float dF = Vector3.Dot(inDir, F);
+
+            if (Mathf.Abs(dF) >= Mathf.Abs(dR))
+                return dR >= 0f ? R : -R;
             else
-            {
-                // Incoming mainly along right/left → exit through forward or back face
-                return dotFwd >= 0 ? prismForward : -prismForward;
-            }
+                return dF >= 0f ? F : -F;
         }
 
         public void ResetLaser() { }

@@ -26,6 +26,11 @@ namespace LightPCG.Research
         [Header("CSV Export")]
         public string csvFileName = "PCG_Results.csv";
 
+        // FIX: Add a delay so the agent finishes exiting the door before a new level is generated.
+        [Header("Timing")]
+        [Tooltip("Wait for the agent to walk out the door before generating a new level (seconds).")]
+        public float exitDoorWait = 3.5f;
+
         private List<RunRecord> records = new List<RunRecord>();
         private int currentRun = 0;
         private int currentSteps;
@@ -71,7 +76,7 @@ namespace LightPCG.Research
                 Debug.Log("[Batch] Run " + currentRun + "/" + totalRuns +
                           " steps=" + currentSteps + " decoys=" + currentDecoys);
 
-                // Generate
+                // Generate level
                 float gStart = Time.realtimeSinceStartup;
                 gridVisualizer.GenerateLevel();
                 float gMs = (Time.realtimeSinceStartup - gStart) * 1000f;
@@ -84,6 +89,10 @@ namespace LightPCG.Research
                 solverAgent.OnSolveComplete = _ => { waiting = false; };
                 solverAgent.StartSolve();
                 while (waiting) yield return null;
+
+                // FIX: Wait for the agent to finish exiting the door.
+                // OnSolveComplete fires during Finish(), which is before ExitDoor is completed.
+                yield return new WaitForSeconds(exitDoorWait);
 
                 bool ok = solverAgent.WasSolved;
 
@@ -110,7 +119,6 @@ namespace LightPCG.Research
                     Debug.Log("[Batch] Solved! Next steps=" + currentSteps +
                               " decoys=" + currentDecoys);
                 }
-                // On fail: keep same difficulty
 
                 if (currentRun % 50 == 0)
                 {

@@ -181,7 +181,7 @@ namespace LightPCG.Core
 
                 if (i < steps - 1)
                 {
-                    TileType bend = (Random.value > 0.4f) ? TileType.Mirror : TileType.Refractor;
+                    TileType bend = TileType.Mirror;
                     if (grid.GetTile(cx, cy) == TileType.Empty)
                     {
                         grid.SetTile(cx, cy, bend);
