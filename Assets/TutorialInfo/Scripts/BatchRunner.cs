@@ -28,8 +28,8 @@ namespace LightPCG.Research
 
         // FIX: Add a delay so the agent finishes exiting the door before a new level is generated.
         [Header("Timing")]
-        [Tooltip("Wait for the agent to walk out the door before generating a new level (seconds).")]
-        public float exitDoorWait = 3.5f;
+        [Tooltip("Wait for the agent to walk out the door before generating a nsew level (seconds).")]
+        public float exitDoorWait = 5.0f;
 
         private List<RunRecord> records = new List<RunRecord>();
         private int currentRun = 0;
@@ -166,5 +166,6 @@ namespace LightPCG.Research
             foreach (var r in records) if (r.solved) s2++;
             Debug.Log("[Batch] COMPLETE " + s2 + "/" + records.Count + " CSV: " + path);
         }
+
     }
 }

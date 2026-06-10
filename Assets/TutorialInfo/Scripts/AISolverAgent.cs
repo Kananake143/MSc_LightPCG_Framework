@@ -16,7 +16,7 @@ namespace LightPCG.Systems
         public float rotationSpeed = 15f;
 
         [Header("Timing")]
-        public float physicsWait = 0.15f;
+        public float physicsWait = 0.3f;
         public float stepDelay = 0.05f;
 
         [Header("Limits")]
@@ -69,8 +69,11 @@ namespace LightPCG.Systems
         {
             if (running) return;
             running = true;
-            WasSolved = false; SolveIterations = 0; TotalPlacements = 0;
+            WasSolved = false;
+            SolveIterations = 0;
+            TotalPlacements = 0;
             memory.Clear();
+            allLasers = null; // force refresh
             StartCoroutine(Pipeline());
         }
 
@@ -200,14 +203,23 @@ namespace LightPCG.Systems
                             yield break;
                         }
 
-                        // เปรียบเทียบ score หลังวาง vs ก่อนวาง
+                        // ใน Phase2_PlaceChain
                         if (ScoreBeam(receiver) > prevScore)
                         {
-                            Debug.Log($"[AI] Keep {objType}@{targetCell} rot {rot}deg " +
-                                      $"score {prevScore}->{ScoreBeam(receiver)}");
-                            cellKept = true;
-                            go = null;
-                            break;
+                            // เพิ่มเงื่อนไข: keep เฉพาะถ้า score ดีขึ้นจริงๆ
+                            // ไม่ keep ถ้า score ยังติดลบมาก (beam ยังห่าง receiver มาก)
+                            int newScore = ScoreBeam(receiver);
+                            bool worthKeeping = newScore > prevScore &&
+                                                newScore > -(grid.Width + grid.Height);
+
+                            if (worthKeeping)
+                            {
+                                Debug.Log($"[AI] Keep {objType}@{targetCell} rot {rot}deg " +
+                                          $"score {prevScore}->{newScore}");
+                                cellKept = true;
+                                go = null;
+                                break;
+                            }
                         }
 
                         // reset rotation แล้วลอง rotation ถัดไป
@@ -270,7 +282,7 @@ namespace LightPCG.Systems
                     if (RealSolved()) break;
                     var objType = grid.GetTile(objCell.x, objCell.y);
                     yield return StartCoroutine(WalkTo(objCell));
-                    int prevLen = BeamLength();
+                    int prevScore4A = ScoreBeam(receiver);
 
                     foreach (int rot in PrioritisedRotations(objType, objCell, receiver))
                     {
@@ -291,7 +303,11 @@ namespace LightPCG.Systems
                             yield break;
                         }
 
-                        if (BeamLength() > prevLen) { prevLen = BeamLength(); break; }
+                        if (ScoreBeam(receiver) > prevScore4A)
+                        {
+                            prevScore4A = ScoreBeam(receiver);
+                            break;
+                        }
                     }
                 }
 
@@ -331,11 +347,12 @@ namespace LightPCG.Systems
                                 yield break;
                             }
 
-                            if (BeamLength() > beam.pathLength) { relocated = true; break; }
+                            int beamScore = ScoreBeam(receiver);
 
                             if (gridVisualizer.SpawnedObjects.TryGetValue(newTarget, out var gr)
                                 && gr != null)
                                 gr.transform.rotation = Quaternion.identity;
+                            if (ScoreBeam(receiver) > beamScore) { relocated = true; break; }
                         }
 
                         if (relocated) break;
@@ -559,36 +576,28 @@ namespace LightPCG.Systems
         // ════════════════════════════════════════════════════════════
         List<Vector2Int> PrioritisedCells(BeamState beam, Vector2Int receiver)
         {
-            // ขั้น 1: ใช้ empty cells บน beam path ก่อน
+            // ขั้น 1: beam path cells เรียงตาม distance ถึง receiver
             var sorted = new List<Vector2Int>(beam.emptyCells);
             sorted.Sort((a, b) => Manhattan(a, receiver).CompareTo(Manhattan(b, receiver)));
             var result = new List<Vector2Int>();
             foreach (var c in sorted) if (!IsExhausted(c)) result.Add(c);
             if (result.Count > 0) return result;
 
-            // ขั้น 2: fallback — เฉพาะ row/col ของ beam endpoint และ receiver
+            // ขั้น 2: row/col ของ beam endpoint และ receiver เท่านั้น
             Vector2Int endCell = beam.endCell;
-            Vector2Int recvCell = receiver;
-
             for (int x = 1; x < grid.Width - 1; x++)
                 for (int y = 1; y < grid.Height - 1; y++)
                 {
                     if (grid.GetTile(x, y) != TileType.Empty) continue;
                     var v = new Vector2Int(x, y);
                     if (IsExhausted(v)) continue;
-
-                    bool onBeamRow = (y == endCell.y);
-                    bool onBeamCol = (x == endCell.x);
-                    bool onRecvRow = (y == recvCell.y);
-                    bool onRecvCol = (x == recvCell.x);
-
-                    if (onBeamRow || onBeamCol || onRecvRow || onRecvCol)
+                    if (y == endCell.y || x == endCell.x || y == receiver.y || x == receiver.x)
                         result.Add(v);
                 }
             result.Sort((a, b) => Manhattan(a, receiver).CompareTo(Manhattan(b, receiver)));
             if (result.Count > 0) return result;
 
-            // ขั้น 3: fallback สุดท้าย — จำกัด Manhattan ≤ ครึ่งด่าน
+            // ขั้น 3: จำกัด Manhattan ≤ ครึ่งด่าน (ไม่เอาทุก cell)
             int threshold = Mathf.Max(grid.Width, grid.Height) / 2;
             for (int x = 1; x < grid.Width - 1; x++)
                 for (int y = 1; y < grid.Height - 1; y++)
@@ -681,9 +690,15 @@ namespace LightPCG.Systems
 
         bool IsExhausted(Vector2Int cell)
         {
-            foreach (var obj in GetInteractables())
-                foreach (int r in new[] { 0, 45, 90, 135, 180, 225, 270, 315 })
-                    if (!WasTried(obj, cell, r)) return false;
+            int[] rots = { 0, 45, 90, 135, 180, 225, 270, 315 };
+            // ตรวจว่ามี rotation ที่ยังไม่ได้ลองสำหรับ cell นี้ไหม
+            foreach (int r in rots)
+            {
+                bool triedByAny = false;
+                foreach (var kv in memory)
+                    if (kv.Value.Contains((cell, r))) { triedByAny = true; break; }
+                if (!triedByAny) return false;
+            }
             return true;
         }
 
