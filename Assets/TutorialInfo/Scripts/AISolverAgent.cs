@@ -51,6 +51,9 @@ namespace LightPCG.Systems
             cc.height = 1.0f;
             cc.center = new Vector3(0, 0.5f, 0);
             cc.minMoveDistance = 0f;
+            cc.skinWidth = 0.08f;   // เพิ่มนี้ ป้องกัน jitter กับพื้น
+            cc.slopeLimit = 0f;      // ไม่ขึ้นลาด
+            cc.stepOffset = 0.1f;    // ก้าวข้ามขอบเล็กๆ ได้
         }
 
         void Start()
@@ -85,17 +88,20 @@ namespace LightPCG.Systems
             if (em == -Vector2Int.one)
             { Debug.LogError("[AI] No Emitter!"); Finish(false); yield break; }
 
+            // Teleport — ปิด cc ก่อน แล้วตั้ง Y ให้อยู่เหนือพื้น
             cc.enabled = false;
-            transform.position = gridVisualizer.GridToWorld(em.x, em.y);
+            Vector3 spawnPos = gridVisualizer.GridToWorld(em.x, em.y);
+            spawnPos.y = 0.5f;
+            transform.position = spawnPos;
+            yield return new WaitForEndOfFrame(); // รอ 1 frame ให้ physics settle
             cc.enabled = true;
-            yield return new WaitForSeconds(physicsWait);
+            yield return new WaitForSeconds(0.3f);
 
             if (RealSolved())
             { Finish(true); yield return StartCoroutine(ExitDoor()); yield break; }
 
             yield return StartCoroutine(Phase1_Scan());
         }
-
         LaserSystem[] FindLaserSystems()
         {
             var list = new List<LaserSystem>();
@@ -158,8 +164,7 @@ namespace LightPCG.Systems
 
                 BeamState beam = ObserveBeam();
                 var cells = PrioritisedCells(beam, receiver);
-                int maxDist = Mathf.Max(grid.Width, grid.Height) / 2;
-                cells = cells.FindAll(c => Manhattan(c, receiver) <= maxDist);
+
                 foreach (var targetCell in cells)
                 {
                     if (RealSolved()) break;
@@ -195,7 +200,7 @@ namespace LightPCG.Systems
                             yield break;
                         }
 
-                        // FIX: เปรียบเทียบ score ใหม่ vs score เก่า (ก่อนวาง)
+                        // FIX: เปรียบเทียบ score หลังวาง vs score ก่อนวาง
                         if (ScoreBeam(receiver) > prevScore)
                         {
                             Debug.Log($"[AI] Keep {objType}@{targetCell} rot {rot}deg");
@@ -227,7 +232,9 @@ namespace LightPCG.Systems
                 yield return StartCoroutine(Phase4_Backtrack());
         }
 
-        // FIX: ย้าย ScoreBeam ออกมาเป็น method ของ class (ไม่ใช่ local function)
+        // FIX: ScoreBeam เป็น method ของ class ไม่ใช่ local function
+        // Score = beam length - (distance จาก beam endpoint ถึง receiver × 2)
+        // ยิ่งสูง = beam ยาวและใกล้ receiver มากขึ้น
         int ScoreBeam(Vector2Int receiver)
         {
             if (RealSolved()) return int.MaxValue;
@@ -235,6 +242,7 @@ namespace LightPCG.Systems
             int distToReceiver = Manhattan(b.endCell, receiver);
             return b.pathLength - distToReceiver * 2;
         }
+        
 
         // ════════════════════════════════════════════════════════════
         // PHASE 4 - BACKTRACK
@@ -351,31 +359,53 @@ namespace LightPCG.Systems
         IEnumerator WalkTo(Vector2Int target)
         {
             if (target == -Vector2Int.one) yield break;
+            if (!InB(target)) yield break;
+
+            Vector3 worldTarget = gridVisualizer.GridToWorld(target.x, target.y);
+            if (Vector3.Distance(transform.position, worldTarget) < 0.2f) yield break;
+
             var path = BFS(WorldToGrid(transform.position), target);
-            if (path == null || path.Count == 0) yield break;
+            if (path == null || path.Count == 0)
+            {
+                Debug.LogWarning($"[AI] BFS no path: {WorldToGrid(transform.position)} -> {target}");
+                yield break;
+            }
 
             foreach (var step in path)
             {
                 Vector3 wt = gridVisualizer.GridToWorld(step.x, step.y);
+                // ใช้ Y เดิมของ agent ไม่เปลี่ยน
                 wt.y = transform.position.y;
-                float to = 5f;
 
-                while (Vector3.Distance(transform.position, wt) > 0.1f && to > 0)
+                float timeout = 5f;
+                while (timeout > 0f)
                 {
-                    to -= Time.deltaTime;
-                    var d = (wt - transform.position).normalized;
-                    if (d.sqrMagnitude > 0.001f)
-                        transform.rotation = Quaternion.Slerp(transform.rotation,
-                            Quaternion.LookRotation(d), rotationSpeed * Time.deltaTime);
-                    cc.Move(d * moveSpeed * Time.deltaTime + Vector3.down * 2f * Time.deltaTime);
+                    timeout -= Time.deltaTime;
+
+                    Vector3 toTarget = wt - transform.position;
+                    toTarget.y = 0f; // เดินแนวราบเท่านั้น
+
+                    // ถึงจุดหมายแล้ว
+                    if (toTarget.magnitude < 0.15f) break;
+
+                    // หมุนหน้าไปทาง target
+                    if (toTarget.sqrMagnitude > 0.001f)
+                        transform.rotation = Quaternion.Slerp(
+                            transform.rotation,
+                            Quaternion.LookRotation(toTarget),
+                            rotationSpeed * Time.deltaTime);
+
+                    // SimpleMove จัดการ gravity ให้เอง ไม่ต้องเพิ่ม move.y
+                    cc.SimpleMove(toTarget.normalized * moveSpeed);
+
                     yield return null;
                 }
             }
         }
-
         List<Vector2Int> BFS(Vector2Int start, Vector2Int goal)
         {
             if (start == goal) return new List<Vector2Int>();
+
             var visited = new HashSet<Vector2Int> { start };
             var parent = new Dictionary<Vector2Int, Vector2Int>();
             var queue = new Queue<Vector2Int>();
@@ -387,19 +417,32 @@ namespace LightPCG.Systems
                 foreach (var d in Dirs4)
                 {
                     var next = cur + d;
+                    if (!InB(next)) continue;
                     if (visited.Contains(next)) continue;
+
                     var t = grid.GetTile(next.x, next.y);
-                    if (t != TileType.Empty && t != TileType.Door && next != goal) continue;
-                    visited.Add(next); parent[next] = cur;
+
+                    // FIX: walkable = Empty หรือ Door หรือ goal เท่านั้น
+                    // Mirror/Refractor/Emitter/Receiver/Wall = ไม่ผ่าน
+                    bool walkable = (t == TileType.Empty || t == TileType.Door || next == goal);
+                    if (!walkable) continue;
+
+                    visited.Add(next);
+                    parent[next] = cur;
+
                     if (next == goal)
                     {
                         var p = new List<Vector2Int>();
                         for (var c = goal; c != start; c = parent[c]) p.Add(c);
-                        p.Reverse(); return p;
+                        p.Reverse();
+                        return p;
                     }
                     queue.Enqueue(next);
                 }
             }
+
+            // FIX: ถ้าหา path ไม่เจอ ลอง teleport ไปใกล้ๆ goal แทน
+            Debug.LogWarning($"[AI] BFS failed {start}->{goal}");
             return null;
         }
 
@@ -427,8 +470,10 @@ namespace LightPCG.Systems
                 while (Vector3.Distance(transform.position, bw) > 0.3f && to > 0)
                 {
                     to -= Time.deltaTime;
-                    var d = (bw - transform.position).normalized;
-                    cc.Move(d * moveSpeed * Time.deltaTime + Vector3.down * 2f * Time.deltaTime);
+                    Vector3 d = bw - transform.position;
+                    d.y = 0f;
+                    d = d.normalized;
+                    cc.SimpleMove(d * moveSpeed); // ใช้ SimpleMove
                     yield return null;
                 }
             }
@@ -514,11 +559,10 @@ namespace LightPCG.Systems
             var result = new List<Vector2Int>();
             foreach (var c in sorted) if (!IsExhausted(c)) result.Add(c);
 
-            // FIX: fallback ไม่ใช้ทุก empty cell
-            // ใช้เฉพาะ cell ที่อยู่ในแนว beam หรือใกล้ receiver เท่านั้น
+            // FIX: fallback จำกัดเฉพาะ row/col ของ beam endpoint และ receiver
+            // ไม่ใช้ทุก empty cell ในด่าน
             if (result.Count == 0)
             {
-                // หา cells ที่อยู่ใน row หรือ column เดียวกับ beam endpoint
                 Vector2Int endCell = beam.endCell;
                 Vector2Int recvCell = receiver;
 
@@ -527,24 +571,20 @@ namespace LightPCG.Systems
                     {
                         if (grid.GetTile(x, y) != TileType.Empty) continue;
                         var v = new Vector2Int(x, y);
+                        if (IsExhausted(v)) continue;
 
-                        // รับเฉพาะ cell ที่:
-                        // อยู่ใน row/col เดียวกับ beam endpoint
-                        // หรืออยู่ใน row/col เดียวกับ receiver
                         bool onBeamRow = (y == endCell.y);
                         bool onBeamCol = (x == endCell.x);
                         bool onRecvRow = (y == recvCell.y);
                         bool onRecvCol = (x == recvCell.x);
 
-                        if ((onBeamRow || onBeamCol || onRecvRow || onRecvCol)
-                            && !IsExhausted(v))
+                        if (onBeamRow || onBeamCol || onRecvRow || onRecvCol)
                             result.Add(v);
                     }
-
                 result.Sort((a, b) => Manhattan(a, receiver).CompareTo(Manhattan(b, receiver)));
             }
 
-            // ถ้ายังว่างอีก → จำกัดแค่ Manhattan distance ≤ threshold จาก receiver
+            // ถ้ายังว่าง → จำกัด Manhattan distance ≤ ครึ่งด่าน
             if (result.Count == 0)
             {
                 int threshold = Mathf.Max(grid.Width, grid.Height) / 2;
@@ -553,7 +593,7 @@ namespace LightPCG.Systems
                     {
                         if (grid.GetTile(x, y) != TileType.Empty) continue;
                         var v = new Vector2Int(x, y);
-                        if (Manhattan(v, receiver) <= threshold && !IsExhausted(v))
+                        if (!IsExhausted(v) && Manhattan(v, receiver) <= threshold)
                             result.Add(v);
                     }
                 result.Sort((a, b) => Manhattan(a, receiver).CompareTo(Manhattan(b, receiver)));
@@ -561,7 +601,6 @@ namespace LightPCG.Systems
 
             return result;
         }
-
         Vector2Int PickObjectToRelocate(Vector2Int receiver)
         {
             var list = GetInteractables();
@@ -748,9 +787,12 @@ namespace LightPCG.Systems
         {
             float ox = (grid.Width - 1) * spacing / 2f;
             float oz = (grid.Height - 1) * spacing / 2f;
-            return new Vector2Int(
-                Mathf.RoundToInt((w.x + ox) / spacing),
-                Mathf.RoundToInt((w.z + oz) / spacing));
+            // FIX: clamp ให้อยู่ใน bounds เสมอ
+            int gx = Mathf.RoundToInt((w.x + ox) / spacing);
+            int gz = Mathf.RoundToInt((w.z + oz) / spacing);
+            gx = Mathf.Clamp(gx, 0, grid.Width - 1);
+            gz = Mathf.Clamp(gz, 0, grid.Height - 1);
+            return new Vector2Int(gx, gz);
         }
 
         bool InB(Vector2Int p)
