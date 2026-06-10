@@ -200,24 +200,29 @@ namespace LightPCG.Systems
                             yield break;
                         }
 
-                        // FIX: เปรียบเทียบ score หลังวาง vs score ก่อนวาง
+                        // เปรียบเทียบ score หลังวาง vs ก่อนวาง
                         if (ScoreBeam(receiver) > prevScore)
                         {
-                            Debug.Log($"[AI] Keep {objType}@{targetCell} rot {rot}deg");
+                            Debug.Log($"[AI] Keep {objType}@{targetCell} rot {rot}deg " +
+                                      $"score {prevScore}->{ScoreBeam(receiver)}");
                             cellKept = true;
                             go = null;
                             break;
                         }
 
+                        // reset rotation แล้วลอง rotation ถัดไป
                         if (gridVisualizer.SpawnedObjects.TryGetValue(targetCell, out var gR)
                             && gR != null)
                             gR.transform.rotation = Quaternion.identity;
                     }
 
                     if (cellKept) break;
+
+                    // ทุก rotation ไม่ดี → หยิบกลับ ลอง cell ถัดไป
                     go = PickupObject(targetCell);
                 }
 
+                // ลองทุก cell แล้วไม่ได้ → restore กลับที่เดิม
                 if (go != null)
                 {
                     yield return StartCoroutine(WalkTo(objCell));
@@ -242,7 +247,7 @@ namespace LightPCG.Systems
             int distToReceiver = Manhattan(b.endCell, receiver);
             return b.pathLength - distToReceiver * 2;
         }
-        
+
 
         // ════════════════════════════════════════════════════════════
         // PHASE 4 - BACKTRACK
@@ -554,51 +559,46 @@ namespace LightPCG.Systems
         // ════════════════════════════════════════════════════════════
         List<Vector2Int> PrioritisedCells(BeamState beam, Vector2Int receiver)
         {
+            // ขั้น 1: ใช้ empty cells บน beam path ก่อน
             var sorted = new List<Vector2Int>(beam.emptyCells);
             sorted.Sort((a, b) => Manhattan(a, receiver).CompareTo(Manhattan(b, receiver)));
             var result = new List<Vector2Int>();
             foreach (var c in sorted) if (!IsExhausted(c)) result.Add(c);
+            if (result.Count > 0) return result;
 
-            // FIX: fallback จำกัดเฉพาะ row/col ของ beam endpoint และ receiver
-            // ไม่ใช้ทุก empty cell ในด่าน
-            if (result.Count == 0)
-            {
-                Vector2Int endCell = beam.endCell;
-                Vector2Int recvCell = receiver;
+            // ขั้น 2: fallback — เฉพาะ row/col ของ beam endpoint และ receiver
+            Vector2Int endCell = beam.endCell;
+            Vector2Int recvCell = receiver;
 
-                for (int x = 1; x < grid.Width - 1; x++)
-                    for (int y = 1; y < grid.Height - 1; y++)
-                    {
-                        if (grid.GetTile(x, y) != TileType.Empty) continue;
-                        var v = new Vector2Int(x, y);
-                        if (IsExhausted(v)) continue;
+            for (int x = 1; x < grid.Width - 1; x++)
+                for (int y = 1; y < grid.Height - 1; y++)
+                {
+                    if (grid.GetTile(x, y) != TileType.Empty) continue;
+                    var v = new Vector2Int(x, y);
+                    if (IsExhausted(v)) continue;
 
-                        bool onBeamRow = (y == endCell.y);
-                        bool onBeamCol = (x == endCell.x);
-                        bool onRecvRow = (y == recvCell.y);
-                        bool onRecvCol = (x == recvCell.x);
+                    bool onBeamRow = (y == endCell.y);
+                    bool onBeamCol = (x == endCell.x);
+                    bool onRecvRow = (y == recvCell.y);
+                    bool onRecvCol = (x == recvCell.x);
 
-                        if (onBeamRow || onBeamCol || onRecvRow || onRecvCol)
-                            result.Add(v);
-                    }
-                result.Sort((a, b) => Manhattan(a, receiver).CompareTo(Manhattan(b, receiver)));
-            }
+                    if (onBeamRow || onBeamCol || onRecvRow || onRecvCol)
+                        result.Add(v);
+                }
+            result.Sort((a, b) => Manhattan(a, receiver).CompareTo(Manhattan(b, receiver)));
+            if (result.Count > 0) return result;
 
-            // ถ้ายังว่าง → จำกัด Manhattan distance ≤ ครึ่งด่าน
-            if (result.Count == 0)
-            {
-                int threshold = Mathf.Max(grid.Width, grid.Height) / 2;
-                for (int x = 1; x < grid.Width - 1; x++)
-                    for (int y = 1; y < grid.Height - 1; y++)
-                    {
-                        if (grid.GetTile(x, y) != TileType.Empty) continue;
-                        var v = new Vector2Int(x, y);
-                        if (!IsExhausted(v) && Manhattan(v, receiver) <= threshold)
-                            result.Add(v);
-                    }
-                result.Sort((a, b) => Manhattan(a, receiver).CompareTo(Manhattan(b, receiver)));
-            }
-
+            // ขั้น 3: fallback สุดท้าย — จำกัด Manhattan ≤ ครึ่งด่าน
+            int threshold = Mathf.Max(grid.Width, grid.Height) / 2;
+            for (int x = 1; x < grid.Width - 1; x++)
+                for (int y = 1; y < grid.Height - 1; y++)
+                {
+                    if (grid.GetTile(x, y) != TileType.Empty) continue;
+                    var v = new Vector2Int(x, y);
+                    if (!IsExhausted(v) && Manhattan(v, receiver) <= threshold)
+                        result.Add(v);
+                }
+            result.Sort((a, b) => Manhattan(a, receiver).CompareTo(Manhattan(b, receiver)));
             return result;
         }
         Vector2Int PickObjectToRelocate(Vector2Int receiver)
