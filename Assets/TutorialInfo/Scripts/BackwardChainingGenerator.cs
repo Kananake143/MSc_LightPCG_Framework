@@ -70,8 +70,11 @@ namespace LightPCG.Core
         // ════════════════════════════════════════════════════════════════
         void PlacePillars(int steps)
         {
-            // Number of pillars scales with difficulty but stays moderate
-            int targetPillars = Mathf.Clamp(steps * 2, 3, 10);
+            // ลด pillar เมื่อ steps สูง เพราะมีวัตถุเยอะแล้ว
+            int targetPillars = steps <= 5
+                ? Mathf.Clamp(steps * 2, 3, 10)
+                : Mathf.Clamp(steps, 2, 5);  // steps สูง → pillar น้อยลง
+
             int attempts = targetPillars * 15;
 
             for (int a = 0; a < attempts && targetPillars > 0; a++)
