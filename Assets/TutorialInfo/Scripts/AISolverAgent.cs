@@ -5,6 +5,17 @@ using LightPCG.Core;
 
 namespace LightPCG.Systems
 {
+    /// <summary>
+    /// Backtracking Search Solver (v2 — handles in-place rotation + relocation).
+    ///
+    /// Search strategy:
+    ///   Phase 1A — In-place rotation search (O(8^n), n = movable objects).
+    ///              Covers the majority of cases because the generator guarantees
+    ///              solution objects are already on the solution path.
+    ///   Phase 1B — Relocation + rotation DFS, used when decoys block the path.
+    ///   Phase 2  — Physical execution of the verified plan.
+    ///   Fallback  — Correction sweep if physics disagrees with logic.
+    /// </summary>
     [RequireComponent(typeof(CharacterController))]
     public class AISolverAgent : MonoBehaviour
     {
@@ -16,37 +27,80 @@ namespace LightPCG.Systems
         public float rotationSpeed = 15f;
 
         [Header("Timing")]
-        public float physicsWait = 0.3f;
+        public float physicsWait = 0.15f;
         public float stepDelay = 0.05f;
 
-        [Header("Limits")]
-        public int maxIterations = 300;
-        public int maxBacktrackRounds = 20;
+        [Header("Search Limits")]
+        public int maxSearchNodes = 100000;
+        public int maxPlanDepth = 12;
 
+        // ── Public stats read by BatchRunner ──────────────────────
         [HideInInspector] public bool WasSolved;
+
+        /// Total logical nodes / combos explored across Phase 1A + 1B.
         [HideInInspector] public int SolveIterations;
+
+        /// Wall-clock time from StartSolve() to Finish() in milliseconds.
         [HideInInspector] public float SolveTimeMs;
+
+        /// Time spent in Phase 1A + 1B logical search only (ms).
+        [HideInInspector] public float SearchTimeMs;
+
+        /// Time spent physically executing the plan (ms).
+        [HideInInspector] public float ExecutionTimeMs;
+
+        /// Number of physical pick-up + place actions performed.
         [HideInInspector] public int TotalPlacements;
+
+        /// Number of in-place rotations performed (no move).
+        [HideInInspector] public int InPlaceRotations;
+
+        /// Number of full relocations performed (pickup + move + place).
+        [HideInInspector] public int Relocations;
+
+        /// Which search phase found the solution: "1A", "1B", "Sweep", "None".
+        [HideInInspector] public string SolvePhase = "None";
+
         public System.Action<bool> OnSolveComplete;
 
+        // ── Private state ─────────────────────────────────────────
         private GridModel grid;
         private float spacing;
         private CharacterController cc;
         private LaserSystem[] allLasers;
         private float solveStart;
+        private float searchStart;
+        private float execStart;
         private bool running;
-
-        // Memory: set of (sourceCell, targetCell, rotation) triples already evaluated
-        private HashSet<(Vector2Int, Vector2Int, int)> triedSet
-            = new HashSet<(Vector2Int, Vector2Int, int)>();
-
-        // Cells where every rotation from every source has been tested — skip entirely
-        private HashSet<Vector2Int> exhaustedCells = new HashSet<Vector2Int>();
 
         private static readonly Vector2Int[] Dirs4 = {
             Vector2Int.right, Vector2Int.left,
             new Vector2Int(0,  1), new Vector2Int(0, -1)
         };
+
+        // ════════════════════════════════════════════════════════════
+        // DATA STRUCTURES
+        // ════════════════════════════════════════════════════════════
+
+        /// One step in a solution plan.
+        /// SourceCell == TargetCell means in-place rotation only.
+        struct PlacementAction
+        {
+            public Vector2Int SourceCell;
+            public Vector2Int TargetCell;
+            public TileType ObjType;
+            public int Rotation;
+            public bool IsRotateOnly => SourceCell == TargetCell;
+        }
+
+        /// Logical grid state: cell → (TileType, rotation) for every Mirror/Refractor.
+        struct GridSnapshot
+        {
+            public Dictionary<Vector2Int, (TileType type, int rot)> objects;
+            public GridSnapshot Clone()
+                => new GridSnapshot
+                { objects = new Dictionary<Vector2Int, (TileType, int)>(objects) };
+        }
 
         // ════════════════════════════════════════════════════════════
         // UNITY LIFECYCLE
@@ -81,9 +135,13 @@ namespace LightPCG.Systems
             running = true;
             WasSolved = false;
             SolveIterations = 0;
+            SolveTimeMs = 0f;
+            SearchTimeMs = 0f;
+            ExecutionTimeMs = 0f;
             TotalPlacements = 0;
-            triedSet.Clear();
-            exhaustedCells.Clear();
+            InPlaceRotations = 0;
+            Relocations = 0;
+            SolvePhase = "None";
             allLasers = null;
             StartCoroutine(Pipeline());
         }
@@ -105,298 +163,495 @@ namespace LightPCG.Systems
             if (em == -Vector2Int.one)
             { Debug.LogError("[AI] No Emitter!"); Finish(false); yield break; }
 
-            // Teleport to emitter — disable CC to avoid physics conflicts
             TeleportTo(em);
             yield return new WaitForSeconds(0.3f);
 
-            if (RealSolved()) { Finish(true); yield return StartCoroutine(ExitDoor()); yield break; }
+            if (RealSolved())
+            {
+                SolvePhase = "Trivial";
+                Finish(true);
+                yield return StartCoroutine(ExitDoor());
+                yield break;
+            }
 
-            yield return StartCoroutine(SolveLoop());
+            // ── Phase 1: logical search (no physical movement) ──
+            searchStart = Time.realtimeSinceStartup;
+
+            List<PlacementAction> plan = SolveInPlaceRotations();
+            if (plan != null) SolvePhase = "1A";
+
+            if (plan == null)
+            {
+                Debug.Log("[AI] Phase 1A found no solution — trying relocation search.");
+                plan = SolveWithRelocation();
+                if (plan != null) SolvePhase = "1B";
+            }
+
+            SearchTimeMs = (Time.realtimeSinceStartup - searchStart) * 1000f;
+
+            // ── Phase 2: physical execution ──
+            execStart = Time.realtimeSinceStartup;
+
+            if (plan != null)
+                yield return StartCoroutine(ExecutePlan(plan));
+            else
+            {
+                Debug.LogWarning("[AI] Both search phases exhausted — running sweep fallback.");
+                SolvePhase = "Sweep";
+                yield return StartCoroutine(CorrectionSweep());
+            }
         }
 
         // ════════════════════════════════════════════════════════════
-        // MAIN SOLVE LOOP
-        // Unified loop that replaces Phase1/2/4.
-        // Each iteration picks ONE object, evaluates ALL (cell, rotation)
-        // combinations for it, keeps the single best placement if it
-        // improves the beam score, then moves on.
-        // Falls back to backtrack relocation after exhausting forward passes.
+        // PHASE 1A — IN-PLACE ROTATION SEARCH
         // ════════════════════════════════════════════════════════════
-        IEnumerator SolveLoop()
+        List<PlacementAction> SolveInPlaceRotations()
         {
             Vector2Int receiver = FindFirst(TileType.Receiver);
-            Debug.Log($"[AI] SolveLoop start | receiver={receiver}");
+            GridSnapshot initial = SnapshotGrid();
 
-            // ── Forward pass: try each object in score-priority order ──
-            bool madeProgress = true;
-            while (!RealSolved() && SolveIterations < maxIterations && madeProgress)
+            if (LogicalBeamReachesReceiver(initial, receiver))
+                return new List<PlacementAction>();
+
+            var objects = new List<(Vector2Int cell, TileType type)>();
+            foreach (var kv in initial.objects) objects.Add((kv.Key, kv.Value.type));
+
+            int[] rotations = { 0, 45, 90, 135, 180, 225, 270, 315 };
+            int n = objects.Count;
+            int total = (int)Mathf.Pow(8, n);
+
+            for (int combo = 0; combo < total; combo++)
             {
-                madeProgress = false;
-                var objects = GetInteractables();
-
-                foreach (var objCell in objects)
+                SolveIterations++;
+                var snap = initial.Clone();
+                int tmp = combo;
+                for (int i = 0; i < n; i++)
                 {
-                    if (RealSolved()) break;
-                    if (SolveIterations >= maxIterations) break;
-                    SolveIterations++;
+                    int rotIdx = tmp % 8; tmp /= 8;
+                    var (cell, type) = objects[i];
+                    snap.objects[cell] = (type, rotations[rotIdx]);
+                }
 
-                    // Snapshot score BEFORE touching this object
-                    // (object is still on the grid at this point)
-                    int baseScore = ScoreBeam(receiver);
-
-                    TileType objType = grid.GetTile(objCell.x, objCell.y);
-                    var cells = PrioritisedCells(ObserveBeam(), receiver);
-
-                    // --- Find the single best (cell, rotation) for this object ---
-                    Vector2Int bestCell = -Vector2Int.one;
-                    int bestRot = 0;
-                    int bestScore = baseScore; // must beat current score to keep
-
-                    // Temporarily remove object so beam simulation is unaffected by it
-                    var savedGo = PickupObject(objCell);
-
-                    foreach (var targetCell in cells)
+                if (LogicalBeamReachesReceiver(snap, receiver))
+                {
+                    var plan = new List<PlacementAction>();
+                    for (int i = 0; i < n; i++)
                     {
-                        if (RealSolved()) break;
-                        if (IsExhausted(targetCell)) continue;
-                        if (grid.GetTile(targetCell.x, targetCell.y) != TileType.Empty) continue;
-
-                        foreach (int rot in PrioritisedRotations(objType, targetCell, receiver))
-                        {
-                            if (WasTried(objCell, targetCell, rot)) continue;
-
-                            // Place temporarily on grid (no GameObject move — pure logic)
-                            grid.SetTile(targetCell.x, targetCell.y, objType);
-
-                            // Rotate the GO in-memory so ObserveBeam reads the right direction
-                            if (savedGo != null) savedGo.transform.rotation = Quaternion.Euler(0f, rot, 0f);
-
-                            int score = ScoreBeamWithObject(targetCell, objType, rot, receiver);
-                            grid.SetTile(targetCell.x, targetCell.y, TileType.Empty);
-
-                            MarkTried(objCell, targetCell, rot);
-                            TotalPlacements++;
-
-                            if (score > bestScore)
+                        var (cell, type) = objects[i];
+                        int newRot = snap.objects[cell].rot;
+                        int oldRot = initial.objects[cell].rot;
+                        if (newRot != oldRot)
+                            plan.Add(new PlacementAction
                             {
-                                bestScore = score;
-                                bestCell = targetCell;
-                                bestRot = rot;
-                            }
-                        }
+                                SourceCell = cell,
+                                TargetCell = cell,
+                                ObjType = type,
+                                Rotation = newRot
+                            });
                     }
+                    Debug.Log($"[AI] Phase 1A: {plan.Count} rotations in {SolveIterations} combos.");
+                    return plan;
+                }
+            }
+            Debug.Log($"[AI] Phase 1A exhausted {total} combos.");
+            return null;
+        }
 
-                    if (bestCell != -Vector2Int.one)
+        // ════════════════════════════════════════════════════════════
+        // PHASE 1B — RELOCATION + ROTATION SEARCH
+        // ════════════════════════════════════════════════════════════
+        List<PlacementAction> SolveWithRelocation()
+        {
+            Vector2Int receiver = FindFirst(TileType.Receiver);
+            GridSnapshot initial = SnapshotGrid();
+
+            if (LogicalBeamReachesReceiver(initial, receiver))
+                return new List<PlacementAction>();
+
+            var visited = new HashSet<string>();
+            var stack = new Stack<(GridSnapshot snap, List<PlacementAction> plan)>();
+            stack.Push((initial, new List<PlacementAction>()));
+
+            while (stack.Count > 0 && SolveIterations < maxSearchNodes)
+            {
+                var (snap, plan) = stack.Pop();
+                SolveIterations++;
+
+                string key = SnapshotKey(snap);
+                if (visited.Contains(key)) continue;
+                visited.Add(key);
+                if (plan.Count >= maxPlanDepth) continue;
+
+                var beam = LogicalBeam(snap, receiver);
+                var actions = GenerateRelocateActions(snap, beam, receiver);
+
+                foreach (var action in actions)
+                {
+                    var next = ApplyAction(snap, action);
+                    if (LogicalBeamReachesReceiver(next, receiver))
                     {
-                        // Commit the best placement physically
-                        yield return StartCoroutine(WalkTo(bestCell));
-                        PlaceObject(bestCell, objType, savedGo, bestRot);
-                        yield return new WaitForSeconds(physicsWait);
-
-                        if (RealSolved())
-                        {
-                            Debug.Log($"[AI] SOLVED | {objType}@{bestCell} rot={bestRot}");
-                            Finish(true);
-                            yield return StartCoroutine(ExitDoor());
-                            yield break;
-                        }
-
-                        madeProgress = true;
-                        Debug.Log($"[AI] Placed {objType}@{bestCell} rot={bestRot} " +
-                                  $"score {baseScore}->{bestScore}");
+                        var finalPlan = new List<PlacementAction>(plan) { action };
+                        Debug.Log($"[AI] Phase 1B: {finalPlan.Count} moves, {SolveIterations} nodes.");
+                        return finalPlan;
                     }
-                    else
-                    {
-                        // No improvement found — restore object to original cell
-                        yield return StartCoroutine(WalkTo(objCell));
-                        PlaceObject(objCell, objType, savedGo, 0);
-                        yield return new WaitForSeconds(physicsWait);
-                        Debug.Log($"[AI] No gain for {objType}@{objCell} — restored");
-                    }
+                    string nextKey = SnapshotKey(next);
+                    if (!visited.Contains(nextKey))
+                        stack.Push((next, new List<PlacementAction>(plan) { action }));
+                }
+            }
+            Debug.LogWarning($"[AI] Phase 1B exhausted after {SolveIterations} nodes.");
+            return null;
+        }
 
-                    yield return null; // yield between objects so Unity doesn't freeze
+        List<PlacementAction> GenerateRelocateActions(GridSnapshot snap,
+                                                      LogicalBeamResult beam,
+                                                      Vector2Int receiver)
+        {
+            var actions = new List<PlacementAction>();
+            var objList = new List<(Vector2Int cell, TileType type)>();
+            foreach (var kv in snap.objects) objList.Add((kv.Key, kv.Value.type));
+            var candidates = LogicalCandidates(snap, beam, receiver);
+
+            foreach (var (srcCell, objType) in objList)
+                foreach (var tgt in candidates)
+                {
+                    if (tgt == srcCell || snap.objects.ContainsKey(tgt)) continue;
+                    Vector2Int inDir = LogicalIncomingDir(snap, tgt, beam);
+                    foreach (int rot in DeflectionRotationsForDir(objType, inDir, receiver - tgt))
+                        actions.Add(new PlacementAction
+                        { SourceCell = srcCell, TargetCell = tgt, ObjType = objType, Rotation = rot });
+                }
+
+            actions.Sort((a, b) =>
+            {
+                int sA = LogicalBeamScore(ApplyAction(snap, a), receiver);
+                int sB = LogicalBeamScore(ApplyAction(snap, b), receiver);
+                return sB.CompareTo(sA);
+            });
+            return actions;
+        }
+
+        // ════════════════════════════════════════════════════════════
+        // LOGICAL BEAM SIMULATION
+        // ════════════════════════════════════════════════════════════
+        struct LogicalBeamResult
+        {
+            public List<Vector2Int> path;
+            public Vector2Int endCell;
+            public bool hitReceiver;
+        }
+
+        LogicalBeamResult LogicalBeam(GridSnapshot snap, Vector2Int receiver)
+        {
+            var result = new LogicalBeamResult
+            { path = new List<Vector2Int>(), endCell = Vector2Int.zero, hitReceiver = false };
+
+            Vector2Int emitter = FindFirst(TileType.Emitter);
+            if (emitter == -Vector2Int.one) return result;
+
+            var pos = emitter;
+            var dir = EmDirLogical(emitter);
+            var seen = new HashSet<(Vector2Int, Vector2Int)>();
+
+            for (int i = 0; i < grid.Width * grid.Height * 2; i++)
+            {
+                pos += dir;
+                if (!InB(pos)) break;
+                var st = (pos, dir);
+                if (seen.Contains(st)) break;
+                seen.Add(st);
+                result.path.Add(pos);
+                result.endCell = pos;
+
+                TileType ft = grid.GetTile(pos.x, pos.y);
+                if (ft == TileType.Wall || ft == TileType.Emitter) break;
+                if (ft == TileType.Receiver) { result.hitReceiver = true; break; }
+
+                if (snap.objects.TryGetValue(pos, out var obj))
+                {
+                    dir = obj.type == TileType.Mirror
+                        ? MirrorDeflect(dir, obj.rot)
+                        : RefractorDeflect(dir, obj.rot);
+                }
+            }
+            return result;
+        }
+
+        bool LogicalBeamReachesReceiver(GridSnapshot snap, Vector2Int receiver)
+            => LogicalBeam(snap, receiver).hitReceiver;
+
+        int LogicalBeamScore(GridSnapshot snap, Vector2Int receiver)
+        {
+            var b = LogicalBeam(snap, receiver);
+            if (b.hitReceiver) return int.MaxValue;
+            return b.path.Count - Manhattan(b.endCell, receiver) * 2;
+        }
+
+        // ════════════════════════════════════════════════════════════
+        // CANDIDATE CELLS
+        // ════════════════════════════════════════════════════════════
+        List<Vector2Int> LogicalCandidates(GridSnapshot snap,
+                                           LogicalBeamResult beam,
+                                           Vector2Int receiver)
+        {
+            var tier1 = new List<Vector2Int>();
+            foreach (var cell in beam.path)
+            {
+                if (snap.objects.ContainsKey(cell) || grid.GetTile(cell.x, cell.y) != TileType.Empty) continue;
+                if ((cell.y == receiver.y || cell.x == receiver.x) &&
+                     LogicalClearLine(snap, cell, receiver)) tier1.Add(cell);
+            }
+            tier1.Sort((a, b) => Manhattan(a, receiver).CompareTo(Manhattan(b, receiver)));
+            if (tier1.Count > 0) return tier1;
+
+            var tier2 = new List<Vector2Int>();
+            foreach (var cell in beam.path)
+            {
+                if (snap.objects.ContainsKey(cell) || grid.GetTile(cell.x, cell.y) != TileType.Empty) continue;
+                if (cell.y == receiver.y || cell.x == receiver.x) tier2.Add(cell);
+            }
+            tier2.Sort((a, b) => Manhattan(a, receiver).CompareTo(Manhattan(b, receiver)));
+            if (tier2.Count > 0) return tier2;
+
+            var tier3 = new List<Vector2Int>();
+            for (int x = 1; x < grid.Width - 1; x++)
+                for (int y = 1; y < grid.Height - 1; y++)
+                {
+                    var v = new Vector2Int(x, y);
+                    if (snap.objects.ContainsKey(v) || grid.GetTile(x, y) != TileType.Empty) continue;
+                    if (v.y == receiver.y || v.x == receiver.x) tier3.Add(v);
+                }
+            tier3.Sort((a, b) => Manhattan(a, receiver).CompareTo(Manhattan(b, receiver)));
+            if (tier3.Count > 0) return tier3;
+
+            var tier4 = new List<Vector2Int>();
+            for (int x = 1; x < grid.Width - 1; x++)
+                for (int y = 1; y < grid.Height - 1; y++)
+                {
+                    var v = new Vector2Int(x, y);
+                    if (!snap.objects.ContainsKey(v) && grid.GetTile(x, y) == TileType.Empty)
+                        tier4.Add(v);
+                }
+            tier4.Sort((a, b) => Manhattan(a, receiver).CompareTo(Manhattan(b, receiver)));
+            return tier4;
+        }
+
+        bool LogicalClearLine(GridSnapshot snap, Vector2Int from, Vector2Int to)
+        {
+            if (from == to) return true;
+            if (from.x != to.x && from.y != to.y) return false;
+            Vector2Int step = new Vector2Int(
+                from.x == to.x ? 0 : (int)Mathf.Sign(to.x - from.x),
+                from.y == to.y ? 0 : (int)Mathf.Sign(to.y - from.y));
+            var cur = from + step;
+            while (cur != to)
+            {
+                TileType t = grid.GetTile(cur.x, cur.y);
+                if (t == TileType.Wall || t == TileType.Emitter || t == TileType.Door) return false;
+                if (snap.objects.ContainsKey(cur)) return false;
+                cur += step;
+            }
+            return true;
+        }
+
+        Vector2Int LogicalIncomingDir(GridSnapshot snap, Vector2Int cell, LogicalBeamResult beam)
+        {
+            Vector2Int emitter = FindFirst(TileType.Emitter);
+            var pos = emitter;
+            var dir = EmDirLogical(emitter);
+            var seen = new HashSet<(Vector2Int, Vector2Int)>();
+            for (int i = 0; i < grid.Width * grid.Height * 2; i++)
+            {
+                if (pos + dir == cell) return dir;
+                pos += dir;
+                if (!InB(pos)) break;
+                var st = (pos, dir);
+                if (seen.Contains(st)) break;
+                seen.Add(st);
+                TileType ft = grid.GetTile(pos.x, pos.y);
+                if (ft == TileType.Wall || ft == TileType.Receiver || ft == TileType.Emitter) break;
+                if (snap.objects.TryGetValue(pos, out var obj))
+                    dir = obj.type == TileType.Mirror
+                        ? MirrorDeflect(dir, obj.rot) : RefractorDeflect(dir, obj.rot);
+            }
+            return dir;
+        }
+
+        // ════════════════════════════════════════════════════════════
+        // DEFLECTION ROTATION SELECTOR
+        // ════════════════════════════════════════════════════════════
+        List<int> DeflectionRotationsForDir(TileType objType, Vector2Int inDir, Vector2Int toReceiver)
+        {
+            Vector2Int outDir;
+            if (Mathf.Abs(toReceiver.x) >= Mathf.Abs(toReceiver.y))
+                outDir = toReceiver.x >= 0 ? Vector2Int.right : Vector2Int.left;
+            else
+                outDir = toReceiver.y >= 0 ? new Vector2Int(0, 1) : new Vector2Int(0, -1);
+
+            var good = new List<int>(); var fallback = new List<int>();
+            foreach (int rot in new int[] { 0, 45, 90, 135, 180, 225, 270, 315 })
+            {
+                Vector2Int res = objType == TileType.Mirror
+                    ? MirrorDeflect(inDir, rot) : RefractorDeflect(inDir, rot);
+                if (res == outDir) good.Add(rot); else fallback.Add(rot);
+            }
+            good.AddRange(fallback);
+            return good;
+        }
+
+        // ════════════════════════════════════════════════════════════
+        // SNAPSHOT HELPERS
+        // ════════════════════════════════════════════════════════════
+        GridSnapshot SnapshotGrid()
+        {
+            var snap = new GridSnapshot
+            { objects = new Dictionary<Vector2Int, (TileType, int)>() };
+            for (int x = 0; x < grid.Width; x++)
+                for (int y = 0; y < grid.Height; y++)
+                {
+                    TileType t = grid.GetTile(x, y);
+                    if (t != TileType.Mirror && t != TileType.Refractor) continue;
+                    var cell = new Vector2Int(x, y);
+                    int rawRot = Mathf.RoundToInt(GetYRot(cell));
+                    int rot = (((rawRot % 360) + 360) % 360);
+                    rot = Mathf.RoundToInt(rot / 45f) * 45 % 360;
+                    snap.objects[cell] = (t, rot);
+                }
+            return snap;
+        }
+
+        GridSnapshot ApplyAction(GridSnapshot snap, PlacementAction a)
+        {
+            var next = snap.Clone();
+            if (a.SourceCell != a.TargetCell) next.objects.Remove(a.SourceCell);
+            next.objects[a.TargetCell] = (a.ObjType, a.Rotation);
+            return next;
+        }
+
+        string SnapshotKey(GridSnapshot snap)
+        {
+            var parts = new List<string>(snap.objects.Count);
+            foreach (var kv in snap.objects)
+                parts.Add($"{kv.Key.x},{kv.Key.y},{(int)kv.Value.type},{kv.Value.rot}");
+            parts.Sort();
+            return string.Join("|", parts);
+        }
+
+        // ════════════════════════════════════════════════════════════
+        // PHASE 2 — PHYSICAL EXECUTION
+        // ════════════════════════════════════════════════════════════
+        IEnumerator ExecutePlan(List<PlacementAction> plan)
+        {
+            Debug.Log($"[AI] Executing plan: {plan.Count} steps.");
+
+            foreach (var action in plan)
+            {
+                if (RealSolved()) break;
+                TotalPlacements++;
+
+                if (action.IsRotateOnly)
+                {
+                    // In-place rotation — walk to cell and rotate
+                    InPlaceRotations++;
+                    Debug.Log($"[AI] Rotate {action.ObjType}@{action.TargetCell} -> {action.Rotation}°");
+                    yield return StartCoroutine(WalkTo(action.TargetCell));
+                    if (gridVisualizer.SpawnedObjects.TryGetValue(
+                            action.TargetCell, out var goR) && goR != null)
+                        goR.transform.rotation = Quaternion.Euler(0f, action.Rotation, 0f);
+                    yield return new WaitForSeconds(physicsWait);
+                }
+                else
+                {
+                    // Relocation — walk to source, pickup, walk to target, place
+                    Relocations++;
+                    Debug.Log($"[AI] Move {action.ObjType} " +
+                              $"{action.SourceCell}->{action.TargetCell} rot={action.Rotation}°");
+                    yield return StartCoroutine(WalkTo(action.SourceCell));
+                    yield return new WaitForSeconds(stepDelay);
+                    GameObject heldGo = PickupObject(action.SourceCell);
+                    yield return StartCoroutine(WalkTo(action.TargetCell));
+                    PlaceObject(action.TargetCell, action.ObjType, heldGo, action.Rotation);
+                    yield return new WaitForSeconds(physicsWait);
                 }
             }
 
-            if (!RealSolved())
-                yield return StartCoroutine(BacktrackLoop(receiver));
+            ExecutionTimeMs = (Time.realtimeSinceStartup - execStart) * 1000f;
+            yield return new WaitForSeconds(physicsWait * 2f);
+
+            if (RealSolved())
+            {
+                Debug.Log("[AI] Plan verified — SOLVED!");
+                Finish(true);
+                yield return StartCoroutine(ExitDoor());
+            }
+            else
+            {
+                Debug.LogWarning("[AI] Plan failed under physics — running sweep.");
+                SolvePhase = "Sweep";
+                yield return StartCoroutine(CorrectionSweep());
+            }
         }
 
         // ════════════════════════════════════════════════════════════
-        // BACKTRACK LOOP
-        // When the forward pass stalls, pick the least-useful object,
-        // clear its tried-memory, and force it to a new location.
-        // Also re-rotates every object in place each round (4A).
+        // CORRECTION SWEEP (last-resort fallback)
         // ════════════════════════════════════════════════════════════
-        IEnumerator BacktrackLoop(Vector2Int receiver)
+        IEnumerator CorrectionSweep()
         {
-            Debug.Log("[AI] BacktrackLoop start");
-
-            for (int round = 0;
-                 round < maxBacktrackRounds && !RealSolved() && SolveIterations < maxIterations;
-                 round++)
+            int[] rots = { 0, 45, 90, 135, 180, 225, 270, 315 };
+            for (int pass = 0; pass < 3 && !RealSolved(); pass++)
             {
-                SolveIterations++;
-                Debug.Log($"[AI] Backtrack round {round + 1}/{maxBacktrackRounds}");
-
-                // 4A — re-rotate every object in its current position
                 foreach (var objCell in GetInteractables())
                 {
                     if (RealSolved()) break;
-                    var objType = grid.GetTile(objCell.x, objCell.y);
                     yield return StartCoroutine(WalkTo(objCell));
-
-                    foreach (int rot in AllRotations())
+                    foreach (int rot in rots)
                     {
-                        if (WasTried(objCell, objCell, rot)) continue;
-
-                        if (gridVisualizer.SpawnedObjects.TryGetValue(objCell, out var goR) && goR != null)
-                            goR.transform.rotation = Quaternion.Euler(0f, rot, 0f);
-
+                        if (gridVisualizer.SpawnedObjects.TryGetValue(objCell, out var go) && go != null)
+                            go.transform.rotation = Quaternion.Euler(0f, rot, 0f);
                         yield return new WaitForSeconds(physicsWait);
-                        MarkTried(objCell, objCell, rot);
-
                         if (RealSolved())
                         {
-                            Debug.Log("[AI] SOLVED BacktrackLoop 4A!");
+                            ExecutionTimeMs = (Time.realtimeSinceStartup - execStart) * 1000f;
+                            Debug.Log($"[AI] Sweep solved! {rot}°@{objCell}");
                             Finish(true);
                             yield return StartCoroutine(ExitDoor());
                             yield break;
                         }
                     }
                 }
-
-                // 4B — relocate the object that contributes least to current beam
-                if (!RealSolved())
-                {
-                    var worstCell = PickObjectToRelocate(receiver);
-                    if (worstCell == -Vector2Int.one) break;
-
-                    var worstType = grid.GetTile(worstCell.x, worstCell.y);
-                    var beam = ObserveBeam();
-                    var cells = PrioritisedCells(beam, receiver);
-
-                    // Clear this object's tried-memory so it can try positions again
-                    ClearTriedFor(worstCell);
-
-                    yield return StartCoroutine(WalkTo(worstCell));
-                    var savedGo = PickupObject(worstCell);
-
-                    bool relocated = false;
-                    int baseScore = ScoreBeam(receiver);
-
-                    foreach (var newTarget in cells)
-                    {
-                        if (newTarget == worstCell) continue;
-                        if (grid.GetTile(newTarget.x, newTarget.y) != TileType.Empty) continue;
-                        if (IsExhausted(newTarget)) continue;
-
-                        foreach (int rot in PrioritisedRotations(worstType, newTarget, receiver))
-                        {
-                            if (WasTried(worstCell, newTarget, rot)) continue;
-
-                            yield return StartCoroutine(WalkTo(newTarget));
-                            PlaceObject(newTarget, worstType, savedGo, rot);
-                            TotalPlacements++;
-                            yield return new WaitForSeconds(physicsWait);
-                            MarkTried(worstCell, newTarget, rot);
-
-                            if (RealSolved())
-                            {
-                                Debug.Log("[AI] SOLVED BacktrackLoop 4B!");
-                                Finish(true);
-                                yield return StartCoroutine(ExitDoor());
-                                yield break;
-                            }
-
-                            int newScore = ScoreBeam(receiver);
-                            if (newScore > baseScore)
-                            {
-                                relocated = true;
-                                Debug.Log($"[AI] 4B placed {worstType}@{newTarget} " +
-                                          $"rot={rot} score {baseScore}->{newScore}");
-                                savedGo = null; // now owned by the grid
-                                break;
-                            }
-
-                            // Not better — pick back up and try next rotation
-                            savedGo = PickupObject(newTarget);
-                        }
-                        if (relocated || savedGo == null) break;
-                    }
-
-                    // Restore if no better location was found
-                    if (!relocated && savedGo != null)
-                    {
-                        yield return StartCoroutine(WalkTo(worstCell));
-                        PlaceObject(worstCell, worstType, savedGo, 0);
-                        yield return new WaitForSeconds(physicsWait);
-                        Debug.Log($"[AI] 4B restored {worstType} -> {worstCell}");
-                    }
-                }
             }
-
             if (!RealSolved())
             {
-                Debug.LogWarning($"[AI] Failed | iters={SolveIterations} placements={TotalPlacements}");
+                ExecutionTimeMs = (Time.realtimeSinceStartup - execStart) * 1000f;
+                Debug.LogWarning("[AI] All phases failed.");
                 Finish(false);
             }
         }
 
         // ════════════════════════════════════════════════════════════
-        // BEAM SCORE
-        // Evaluates the grid-logic beam.
-        // ScoreBeamWithObject: temporarily places an object on the grid
-        // (GameObject already has the right rotation set) then scores.
-        // ════════════════════════════════════════════════════════════
-        int ScoreBeam(Vector2Int receiver)
-        {
-            if (RealSolved()) return int.MaxValue;
-            var b = ObserveBeam();
-            return b.pathLength - Manhattan(b.endCell, receiver) * 2;
-        }
-
-        int ScoreBeamWithObject(Vector2Int cell, TileType type, int rot, Vector2Int receiver)
-        {
-            // Grid tile is already set by caller; just score
-            var b = ObserveBeam();
-            return b.pathLength - Manhattan(b.endCell, receiver) * 2;
-        }
-
-        // ════════════════════════════════════════════════════════════
-        // WALK TO — BFS pathfinding with teleport fallback
+        // WALK TO / TELEPORT / BFS
         // ════════════════════════════════════════════════════════════
         IEnumerator WalkTo(Vector2Int target)
         {
             if (target == -Vector2Int.one || !InB(target)) yield break;
-
-            Vector3 worldTarget = gridVisualizer.GridToWorld(target.x, target.y);
-            if (Vector3.Distance(transform.position, worldTarget) < 0.2f) yield break;
-
+            Vector3 wt = gridVisualizer.GridToWorld(target.x, target.y);
+            if (Vector3.Distance(transform.position, wt) < 0.2f) yield break;
             var path = BFS(WorldToGrid(transform.position), target);
-            if (path == null || path.Count == 0)
-            {
-                Debug.LogWarning($"[AI] BFS no path -> {target}; teleporting.");
-                TeleportTo(target);
-                yield break;
-            }
-
+            if (path == null || path.Count == 0) { TeleportTo(target); yield break; }
             foreach (var step in path)
             {
-                Vector3 wt = gridVisualizer.GridToWorld(step.x, step.y);
-                wt.y = transform.position.y;
-
+                Vector3 dest = gridVisualizer.GridToWorld(step.x, step.y);
+                dest.y = transform.position.y;
                 float timeout = 5f;
                 while (timeout > 0f)
                 {
                     timeout -= Time.deltaTime;
-                    Vector3 toTarget = wt - transform.position;
-                    toTarget.y = 0f;
-                    if (toTarget.magnitude < 0.15f) break;
-                    if (toTarget.sqrMagnitude > 0.001f)
+                    Vector3 delta = dest - transform.position; delta.y = 0f;
+                    if (delta.magnitude < 0.15f) break;
+                    if (delta.sqrMagnitude > 0.001f)
                         transform.rotation = Quaternion.Slerp(transform.rotation,
-                            Quaternion.LookRotation(toTarget), rotationSpeed * Time.deltaTime);
-                    cc.SimpleMove(toTarget.normalized * moveSpeed);
+                            Quaternion.LookRotation(delta), rotationSpeed * Time.deltaTime);
+                    cc.SimpleMove(delta.normalized * moveSpeed);
                     yield return null;
                 }
             }
@@ -405,24 +660,18 @@ namespace LightPCG.Systems
         void TeleportTo(Vector2Int cell)
         {
             cc.enabled = false;
-            Vector3 p = gridVisualizer.GridToWorld(cell.x, cell.y);
-            p.y = 0.5f;
+            Vector3 p = gridVisualizer.GridToWorld(cell.x, cell.y); p.y = 0.5f;
             transform.position = p;
             cc.enabled = true;
         }
 
-        // ════════════════════════════════════════════════════════════
-        // BFS PATHFINDING
-        // ════════════════════════════════════════════════════════════
         List<Vector2Int> BFS(Vector2Int start, Vector2Int goal)
         {
             if (start == goal) return new List<Vector2Int>();
-
             var visited = new HashSet<Vector2Int> { start };
             var parent = new Dictionary<Vector2Int, Vector2Int>();
             var queue = new Queue<Vector2Int>();
             queue.Enqueue(start);
-
             while (queue.Count > 0)
             {
                 var cur = queue.Dequeue();
@@ -430,18 +679,14 @@ namespace LightPCG.Systems
                 {
                     var next = cur + d;
                     if (!InB(next) || visited.Contains(next)) continue;
-                    var t = grid.GetTile(next.x, next.y);
+                    TileType t = grid.GetTile(next.x, next.y);
                     if (t != TileType.Empty && t != TileType.Door && next != goal) continue;
-
-                    visited.Add(next);
-                    parent[next] = cur;
-
+                    visited.Add(next); parent[next] = cur;
                     if (next == goal)
                     {
                         var p = new List<Vector2Int>();
                         for (var c = goal; c != start; c = parent[c]) p.Add(c);
-                        p.Reverse();
-                        return p;
+                        p.Reverse(); return p;
                     }
                     queue.Enqueue(next);
                 }
@@ -456,15 +701,12 @@ namespace LightPCG.Systems
         {
             yield return new WaitForSeconds(0.4f);
             Vector2Int dc = FindFirst(TileType.Door);
-            if (dc == -Vector2Int.one) { Debug.Log("[AI] Exited (no door)."); yield break; }
-
+            if (dc == -Vector2Int.one) yield break;
             grid.SetTile(dc.x, dc.y, TileType.Empty);
             if (gridVisualizer.SpawnedObjects.TryGetValue(dc, out var dgo) && dgo != null)
                 Destroy(dgo);
             gridVisualizer.SpawnedObjects.Remove(dc);
-
             yield return StartCoroutine(WalkTo(dc));
-
             Vector2Int beyond = dc + OutDir(dc);
             Vector3 bw = gridVisualizer.GridToWorld(beyond.x, beyond.y);
             float timeout = 3f;
@@ -487,202 +729,51 @@ namespace LightPCG.Systems
         }
 
         // ════════════════════════════════════════════════════════════
-        // BEAM OBSERVATION (grid-logic laser simulation)
+        // GRID MATH
         // ════════════════════════════════════════════════════════════
-        struct BeamState
+        Vector2Int MirrorDeflect(Vector2Int d, int rot)
         {
-            public List<Vector2Int> emptyCells;
-            public int pathLength;
-            public Vector2Int endCell;
+            float a = rot;
+            return (Mathf.Abs(Mathf.DeltaAngle(a, 45f)) < 22.5f ||
+                    Mathf.Abs(Mathf.DeltaAngle(a, 225f)) < 22.5f)
+                ? new Vector2Int(d.y, d.x) : new Vector2Int(-d.y, -d.x);
         }
 
-        BeamState ObserveBeam()
+        Vector2Int RefractorDeflect(Vector2Int d, int rot)
         {
-            var s = new BeamState
-            { emptyCells = new List<Vector2Int>(), pathLength = 0, endCell = Vector2Int.zero };
-
-            for (int ex = 0; ex < grid.Width; ex++)
-                for (int ey = 0; ey < grid.Height; ey++)
-                {
-                    if (grid.GetTile(ex, ey) != TileType.Emitter) continue;
-                    var pos = new Vector2Int(ex, ey);
-                    var dir = EmDir(pos);
-                    var seen = new HashSet<(Vector2Int, Vector2Int)>();
-
-                    for (int i = 0; i < grid.Width * grid.Height * 2; i++)
-                    {
-                        pos += dir;
-                        if (!InB(pos)) break;
-                        var st = (pos, dir);
-                        if (seen.Contains(st)) break;
-                        seen.Add(st);
-
-                        s.pathLength++;
-                        s.endCell = pos;
-
-                        var t = grid.GetTile(pos.x, pos.y);
-                        if (t == TileType.Empty && !s.emptyCells.Contains(pos))
-                            s.emptyCells.Add(pos);
-                        if (t == TileType.Receiver || t == TileType.Wall || t == TileType.Emitter) break;
-                        if (t == TileType.Mirror) { dir = GridBounce(dir, pos); continue; }
-                        if (t == TileType.Refractor) { dir = GridRefract(dir, pos); continue; }
-                    }
-                }
-            return s;
+            float a = rot;
+            return (Mathf.Abs(Mathf.DeltaAngle(a, 0f)) < 22.5f ||
+                    Mathf.Abs(Mathf.DeltaAngle(a, 180f)) < 22.5f)
+                ? new Vector2Int(-d.y, d.x) : new Vector2Int(d.y, -d.x);
         }
 
-        // ════════════════════════════════════════════════════════════
-        // SELECTION HELPERS
-        // ════════════════════════════════════════════════════════════
-
-        // Candidate cells sorted by proximity to receiver:
-        // (1) cells on the current beam path, (2) same row/col as beam end or receiver,
-        // (3) anything within half the grid width.
-        List<Vector2Int> PrioritisedCells(BeamState beam, Vector2Int receiver)
+        float GetYRot(Vector2Int cell)
         {
-            var result = new List<Vector2Int>();
-
-            var sorted = new List<Vector2Int>(beam.emptyCells);
-            sorted.Sort((a, b) => Manhattan(a, receiver).CompareTo(Manhattan(b, receiver)));
-            foreach (var c in sorted) if (!IsExhausted(c)) result.Add(c);
-            if (result.Count > 0) return result;
-
-            var endCell = beam.endCell;
-            for (int x = 1; x < grid.Width - 1; x++)
-                for (int y = 1; y < grid.Height - 1; y++)
-                {
-                    if (grid.GetTile(x, y) != TileType.Empty) continue;
-                    var v = new Vector2Int(x, y);
-                    if (IsExhausted(v)) continue;
-                    if (y == endCell.y || x == endCell.x || y == receiver.y || x == receiver.x)
-                        result.Add(v);
-                }
-            result.Sort((a, b) => Manhattan(a, receiver).CompareTo(Manhattan(b, receiver)));
-            if (result.Count > 0) return result;
-
-            int threshold = Mathf.Max(grid.Width, grid.Height) / 2;
-            for (int x = 1; x < grid.Width - 1; x++)
-                for (int y = 1; y < grid.Height - 1; y++)
-                {
-                    if (grid.GetTile(x, y) != TileType.Empty) continue;
-                    var v = new Vector2Int(x, y);
-                    if (!IsExhausted(v) && Manhattan(v, receiver) <= threshold) result.Add(v);
-                }
-            result.Sort((a, b) => Manhattan(a, receiver).CompareTo(Manhattan(b, receiver)));
-            return result;
+            if (gridVisualizer.SpawnedObjects.TryGetValue(cell, out var obj) && obj != null)
+                return obj.transform.eulerAngles.y;
+            return 0f;
         }
 
-        // Choose the object that contributes least to the current beam length
-        Vector2Int PickObjectToRelocate(Vector2Int receiver)
+        Vector2Int EmDirLogical(Vector2Int cell)
         {
-            var list = GetInteractables();
-            if (list.Count == 0) return -Vector2Int.one;
-
-            var beam = ObserveBeam();
-            var onBeam = new List<Vector2Int>();
-            var offBeam = new List<Vector2Int>();
-
-            foreach (var obj in list)
+            if (gridVisualizer.SpawnedObjects.TryGetValue(cell, out var go) && go != null)
             {
-                TileType saved = grid.GetTile(obj.x, obj.y);
-                grid.SetTile(obj.x, obj.y, TileType.Empty);
-                bool useful = ObserveBeam().pathLength < beam.pathLength;
-                grid.SetTile(obj.x, obj.y, saved);
-                if (useful) onBeam.Add(obj); else offBeam.Add(obj);
+                var f = go.transform.forward;
+                if (Mathf.Abs(f.x) >= Mathf.Abs(f.z))
+                    return f.x >= 0 ? Vector2Int.right : Vector2Int.left;
+                return f.z >= 0 ? new Vector2Int(0, 1) : new Vector2Int(0, -1);
             }
-
-            var candidates = offBeam.Count > 0 ? offBeam : onBeam;
-            candidates.Sort((a, b) => Manhattan(b, receiver).CompareTo(Manhattan(a, receiver)));
-            return candidates[0];
-        }
-
-        // Rotations ordered by likelihood of deflecting toward the receiver
-        List<int> PrioritisedRotations(TileType t, Vector2Int cell, Vector2Int receiver)
-        {
-            var d = receiver - cell;
-            bool rx = Mathf.Abs(d.x) > Mathf.Abs(d.y);
-            if (t == TileType.Mirror)
-                return rx ? new List<int> { 45, 225, 135, 315, 0, 90, 180, 270 }
-                          : new List<int> { 135, 315, 45, 225, 0, 90, 180, 270 };
-            return rx ? new List<int> { 0, 180, 90, 270, 45, 135, 225, 315 }
-                          : new List<int> { 90, 270, 0, 180, 45, 135, 225, 315 };
-        }
-
-        List<int> AllRotations() => new List<int> { 0, 45, 90, 135, 180, 225, 270, 315 };
-
-        // ════════════════════════════════════════════════════════════
-        // ATOMIC PICKUP / PLACE
-        // ════════════════════════════════════════════════════════════
-        GameObject PickupObject(Vector2Int cell)
-        {
-            gridVisualizer.SpawnedObjects.TryGetValue(cell, out GameObject go);
-            grid.SetTile(cell.x, cell.y, TileType.Empty);
-            gridVisualizer.SpawnedObjects.Remove(cell);
-            if (go != null) go.SetActive(false);
-            return go;
-        }
-
-        void PlaceObject(Vector2Int cell, TileType type, GameObject go, int rotDeg)
-        {
-            grid.SetTile(cell.x, cell.y, type);
-            gridVisualizer.SpawnedObjects[cell] = go;
-            if (go == null) return;
-            go.transform.position = gridVisualizer.GridToWorld(cell.x, cell.y);
-            go.transform.rotation = Quaternion.Euler(0f, rotDeg, 0f);
-            go.SetActive(true);
-        }
-
-        // ════════════════════════════════════════════════════════════
-        // MEMORY
-        // ════════════════════════════════════════════════════════════
-        void MarkTried(Vector2Int from, Vector2Int to, int rot)
-        {
-            triedSet.Add((from, to, rot));
-
-            // Check if all 8 rotations from any source to this cell have been tried
-            bool allDone = true;
-            foreach (int r in AllRotations())
+            foreach (var d in Dirs4)
             {
-                bool found = false;
-                // We only need at least one source to have tried this (to, r) combo
-                for (int x = 0; x < grid.Width && !found; x++)
-                    for (int y = 0; y < grid.Height && !found; y++)
-                        if (triedSet.Contains((new Vector2Int(x, y), to, r))) found = true;
-                if (!found) { allDone = false; break; }
+                var n = cell + d; if (!InB(n)) continue;
+                TileType t = grid.GetTile(n.x, n.y);
+                if (t != TileType.Wall && t != TileType.Door && t != TileType.Emitter) return d;
             }
-            if (allDone) exhaustedCells.Add(to);
-        }
-
-        bool WasTried(Vector2Int from, Vector2Int to, int rot)
-            => triedSet.Contains((from, to, rot));
-
-        // Remove all memory entries for a given source cell (used in backtrack reset)
-        void ClearTriedFor(Vector2Int from)
-        {
-            var toRemove = new List<(Vector2Int, Vector2Int, int)>();
-            foreach (var entry in triedSet)
-                if (entry.Item1 == from) toRemove.Add(entry);
-            foreach (var e in toRemove) triedSet.Remove(e);
-
-            // Also unmark any cells that were exhausted due to this source
-            exhaustedCells.Clear(); // simplest safe approach: recompute on demand
-        }
-
-        bool IsExhausted(Vector2Int cell) => exhaustedCells.Contains(cell);
-
-        // ════════════════════════════════════════════════════════════
-        // FINISH
-        // ════════════════════════════════════════════════════════════
-        void Finish(bool solved)
-        {
-            WasSolved = solved;
-            SolveTimeMs = (Time.realtimeSinceStartup - solveStart) * 1000f;
-            running = false;
-            OnSolveComplete?.Invoke(solved);
+            return Vector2Int.right;
         }
 
         // ════════════════════════════════════════════════════════════
-        // REAL LASER CHECK — uses Unity physics (LaserSystem raycasts)
+        // REAL LASER CHECK (Unity physics)
         // ════════════════════════════════════════════════════════════
         bool RealSolved()
         {
@@ -710,65 +801,37 @@ namespace LightPCG.Systems
         }
 
         // ════════════════════════════════════════════════════════════
-        // GRID MATH
+        // ATOMIC PICKUP / PLACE
         // ════════════════════════════════════════════════════════════
-
-        // Reflect beam direction off a mirror based on its Y rotation
-        Vector2Int GridBounce(Vector2Int d, Vector2Int cell)
+        GameObject PickupObject(Vector2Int cell)
         {
-            float a = GetYRot(cell);
-            return (Mathf.Abs(Mathf.DeltaAngle(a, 45f)) < 22.5f ||
-                    Mathf.Abs(Mathf.DeltaAngle(a, 225f)) < 22.5f)
-                ? new Vector2Int(d.y, d.x) : new Vector2Int(-d.y, -d.x);
+            gridVisualizer.SpawnedObjects.TryGetValue(cell, out GameObject go);
+            grid.SetTile(cell.x, cell.y, TileType.Empty);
+            gridVisualizer.SpawnedObjects.Remove(cell);
+            if (go != null) go.SetActive(false);
+            return go;
         }
 
-        // Deflect beam direction through a refractor based on its Y rotation
-        Vector2Int GridRefract(Vector2Int d, Vector2Int cell)
+        void PlaceObject(Vector2Int cell, TileType type, GameObject go, int rotDeg)
         {
-            float a = GetYRot(cell);
-            return (Mathf.Abs(Mathf.DeltaAngle(a, 0f)) < 22.5f ||
-                    Mathf.Abs(Mathf.DeltaAngle(a, 180f)) < 22.5f)
-                ? new Vector2Int(-d.y, d.x) : new Vector2Int(d.y, -d.x);
-        }
-
-        float GetYRot(Vector2Int cell)
-        {
-            if (gridVisualizer.SpawnedObjects.TryGetValue(cell, out var obj) && obj != null)
-                return obj.transform.eulerAngles.y;
-            return 0f;
-        }
-
-        // Determine emitter facing direction from its transform or open neighbours
-        Vector2Int EmDir(Vector2Int cell)
-        {
-            if (gridVisualizer.SpawnedObjects.TryGetValue(cell, out var go) && go != null)
-            {
-                var f = go.transform.forward;
-                if (Mathf.Abs(f.x) >= Mathf.Abs(f.z))
-                    return f.x >= 0 ? Vector2Int.right : Vector2Int.left;
-                return f.z >= 0 ? new Vector2Int(0, 1) : new Vector2Int(0, -1);
-            }
-            foreach (var d in Dirs4)
-            {
-                var n = cell + d;
-                if (!InB(n)) continue;
-                var t = grid.GetTile(n.x, n.y);
-                if (t != TileType.Wall && t != TileType.Door && t != TileType.Emitter) return d;
-            }
-            return Vector2Int.right;
+            grid.SetTile(cell.x, cell.y, type);
+            gridVisualizer.SpawnedObjects[cell] = go;
+            if (go == null) return;
+            go.transform.position = gridVisualizer.GridToWorld(cell.x, cell.y);
+            go.transform.rotation = Quaternion.Euler(0f, rotDeg, 0f);
+            go.SetActive(true);
         }
 
         // ════════════════════════════════════════════════════════════
         // UTILITIES
         // ════════════════════════════════════════════════════════════
-
         List<Vector2Int> GetInteractables()
         {
             var l = new List<Vector2Int>();
             for (int x = 0; x < grid.Width; x++)
                 for (int y = 0; y < grid.Height; y++)
                 {
-                    var t = grid.GetTile(x, y);
+                    TileType t = grid.GetTile(x, y);
                     if (t == TileType.Mirror || t == TileType.Refractor) l.Add(new Vector2Int(x, y));
                 }
             return l;
@@ -780,6 +843,16 @@ namespace LightPCG.Systems
                 for (int y = 0; y < grid.Height; y++)
                     if (grid.GetTile(x, y) == target) return new Vector2Int(x, y);
             return -Vector2Int.one;
+        }
+
+        void Finish(bool solved)
+        {
+            WasSolved = solved;
+            SolveTimeMs = (Time.realtimeSinceStartup - solveStart) * 1000f;
+            if (ExecutionTimeMs <= 0f)
+                ExecutionTimeMs = (Time.realtimeSinceStartup - execStart) * 1000f;
+            running = false;
+            OnSolveComplete?.Invoke(solved);
         }
 
         int Manhattan(Vector2Int a, Vector2Int b)
