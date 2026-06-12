@@ -118,19 +118,28 @@ namespace LightPCG.Systems
 
         // ════════════════════════════════════════════════════════════
         // PUBLIC ENTRY POINT
+        // Full reset every call — no memory from previous level survives.
         // ════════════════════════════════════════════════════════════
         public void StartSolve()
         {
-            if (running) return;
+            // Stop any coroutines still running from the previous level.
+            // Do NOT use "if (running) return" — that would block a new level
+            // from starting if the previous run ended abnormally without calling Finish().
+            StopAllCoroutines();
+            running = false; // will be set true below after full reset
+
+            // ── Reset every stat and state field ──
             running = true;
-            WasSolved = false; SolveIterations = 0;
+            WasSolved = false;
+            SolveIterations = 0;
             SolveTimeMs = SearchTimeMs = ExecutionTimeMs = 0f;
             TotalPlacements = InPlaceRotations = Relocations = 0;
-            SolvePhase = "None"; allLasers = null;
+            SolvePhase = "None";
+            allLasers = null;
+            _searchResult = null;
+            solveStart = searchStart = execStart = 0f;
 
-            // Reset grid reference immediately — not inside the coroutine —
-            // so that any code running before the first yield uses the correct
-            // GridModel for the NEW level, not the one from the previous level.
+            // Update grid reference immediately (before first coroutine yield)
             if (gridVisualizer != null)
             {
                 grid = gridVisualizer.LevelGrid;
@@ -163,15 +172,32 @@ namespace LightPCG.Systems
 
             if (RealSolved()) { SolvePhase = "Trivial"; Finish(true); yield return StartCoroutine(ExitDoor()); yield break; }
 
-            // ── Phase 1: logical search ──
+            // ── Phase 1: logical search (coroutine — yields to Unity every YIELD_EVERY iters) ──
             searchStart = Time.realtimeSinceStartup;
-            List<PlacementAction> plan = LogicalSearch();
+            _searchResult = null;
+
+            // Run search as a coroutine with a wall-clock timeout.
+            // If the search hasn't finished within MAX_SEARCH_SECONDS,
+            // abandon it and fall through to the sweep fallback.
+            // This prevents the bot from appearing frozen on very hard levels.
+            bool searchDone = false;
+            StartCoroutine(RunSearchWithFlag(() => searchDone = true));
+            float searchDeadline = Time.realtimeSinceStartup + MAX_SEARCH_SECONDS;
+            while (!searchDone && Time.realtimeSinceStartup < searchDeadline)
+                yield return null;
+
+            if (!searchDone)
+            {
+                Debug.LogWarning($"[AI] Search timeout after {MAX_SEARCH_SECONDS}s — going to sweep.");
+                StopCoroutine("LogicalSearch"); // best-effort stop
+            }
+
             SearchTimeMs = (Time.realtimeSinceStartup - searchStart) * 1000f;
 
             // ── Phase 2: physical execution ──
             execStart = Time.realtimeSinceStartup;
-            if (plan != null)
-                yield return StartCoroutine(ExecutePlan(plan));
+            if (_searchResult != null)
+                yield return StartCoroutine(ExecutePlan(_searchResult));
             else
             {
                 SolvePhase = "Sweep";
@@ -180,81 +206,89 @@ namespace LightPCG.Systems
             }
         }
 
-        // ════════════════════════════════════════════════════════════
-        // LOGICAL SEARCH  (Phase 1)
-        //
-        // Step 1 — Separate objects into on-beam vs off-beam
-        //          by simulating the initial beam.
-        //
-        // Step 2 — 1A-OnBeam: enumerate all rotation combos for
-        //          on-beam objects ONLY. This is the core insight:
-        //          the generator placed solution objects on the beam path,
-        //          so we only need to find the right rotations for them.
-        //          Decoys are off-beam and irrelevant to this search.
-        //          Complexity: O(8^k) where k = on-beam objects (usually 1-3).
-        //
-        // Step 3 — 1A-Full: if on-beam search fails (edge case where the
-        //          initial beam doesn't reach all solution objects yet),
-        //          try all objects.
-        //
-        // Step 4 — 1B: relocation DFS. Moves decoys away from the beam
-        //          or repositions solution objects to new cells.
-        // ════════════════════════════════════════════════════════════
-        List<PlacementAction> LogicalSearch()
+        // Helper: runs LogicalSearch and sets a flag when done,
+        // so the Pipeline can monitor it with a timeout.
+        IEnumerator RunSearchWithFlag(System.Action onDone)
         {
+            yield return StartCoroutine(LogicalSearch());
+            onDone?.Invoke();
+        }
+
+        // ════════════════════════════════════════════════════════════
+        // LOGICAL SEARCH — coroutine so Unity stays responsive
+        // Result written to _searchResult (IEnumerator cannot return values).
+        // Yields every YIELD_EVERY iterations so the main thread renders frames.
+        // ════════════════════════════════════════════════════════════
+        private List<PlacementAction> _searchResult;
+        private const int YIELD_EVERY = 500;  // yield to Unity every N iterations
+        private const float MAX_SEARCH_SECONDS = 8f; // hard wall-clock limit for all search
+
+        IEnumerator LogicalSearch()
+        {
+            _searchResult = null;
             Vector2Int receiver = FindFirst(TileType.Receiver);
             GridSnapshot initial = SnapshotGrid();
 
             if (LogicalBeamReachesReceiver(initial, receiver))
-                return new List<PlacementAction>();
+            { _searchResult = new List<PlacementAction>(); yield break; }
 
-            // Step 1: classify objects by whether the initial beam hits them
             var initialBeam = LogicalBeam(initial, receiver);
-
             var onBeam = new List<(Vector2Int cell, TileType type)>();
             var offBeam = new List<(Vector2Int cell, TileType type)>();
-
             foreach (var kv in initial.objects)
             {
                 var entry = (kv.Key, kv.Value.type);
                 if (initialBeam.pathSet.Contains(kv.Key)) onBeam.Add(entry);
                 else offBeam.Add(entry);
             }
-
             Debug.Log($"[AI] Objects: {onBeam.Count} on-beam, {offBeam.Count} off-beam.");
 
-            // Step 2: 1A-OnBeam — rotate on-beam objects only
-            if (onBeam.Count > 0)
+            // If beam reaches no objects at all (beam hits wall immediately),
+            // skip 1A entirely — no rotation will help — go straight to 1B
+            // which can relocate objects INTO the beam path.
+            if (onBeam.Count == 0 && offBeam.Count > 0)
             {
-                var plan = RotationSearch(initial, onBeam, receiver, "1A-OnBeam");
-                if (plan != null) { SolvePhase = "1A"; return plan; }
+                Debug.LogWarning("[AI] 0 on-beam objects — beam too short. Skipping 1A, going to 1B.");
+                yield return StartCoroutine(RelocationSearch(initial, receiver));
+                if (_searchResult != null) SolvePhase = "1B";
+                yield break;
             }
 
-            // Step 3: 1A-Full — rotate all objects (handles cases where beam
-            //         doesn't yet reach all solution objects)
+            if (onBeam.Count > 0)
+            {
+                yield return StartCoroutine(RotationSearch(initial, onBeam, receiver, "1A-OnBeam"));
+                if (_searchResult != null) { SolvePhase = "1A"; yield break; }
+            }
+
             var allObjs = new List<(Vector2Int, TileType)>(onBeam);
             allObjs.AddRange(offBeam);
             if (allObjs.Count > onBeam.Count)
             {
-                var plan = RotationSearch(initial, allObjs, receiver, "1A-Full");
-                if (plan != null) { SolvePhase = "1A"; return plan; }
+                yield return StartCoroutine(RotationSearch(initial, allObjs, receiver, "1A-Full"));
+                if (_searchResult != null) { SolvePhase = "1A"; yield break; }
             }
 
-            // Step 4: 1B — relocation DFS
             Debug.Log("[AI] Phase 1A exhausted — trying relocation search (1B).");
-            var plan1B = RelocationSearch(initial, receiver);
-            if (plan1B != null) { SolvePhase = "1B"; return plan1B; }
-
-            return null;
+            yield return StartCoroutine(RelocationSearch(initial, receiver));
+            if (_searchResult != null) SolvePhase = "1B";
         }
 
         // ────────────────────────────────────────────────────────────
         // ROTATION SEARCH
         // Enumerate all rotation combinations for a given object subset.
-        // Only objects whose rotation differs from initial are included
-        // in the returned plan (no-op rotations are omitted).
+        //
+        // Hard cap: refuse to search more than MAX_1A_COMBOS combinations.
+        // With 8 rotations per object:
+        //   n=1 →       8 combos   (instant)
+        //   n=2 →      64 combos   (instant)
+        //   n=3 →     512 combos   (~1ms)
+        //   n=4 →    4096 combos   (~5ms)
+        //   n=5 →   32768 combos   (~50ms)  ← upper limit for 1A
+        //   n=6 → 262144 combos   (would freeze for several seconds)
         // ────────────────────────────────────────────────────────────
-        List<PlacementAction> RotationSearch(
+        private const int MAX_1A_COMBOS = 32768; // = 8^5, hard ceiling for rotation search
+
+        IEnumerator RotationSearch(
             GridSnapshot initial,
             List<(Vector2Int cell, TileType type)> objects,
             Vector2Int receiver,
@@ -264,12 +298,23 @@ namespace LightPCG.Systems
             int n = objects.Count;
             int total = (int)Mathf.Pow(8, n);
 
+            // Skip if too many combinations — fall through to beam search (1B)
+            if (total > MAX_1A_COMBOS)
+            {
+                Debug.Log($"[AI] {label}: skipped ({total} combos > limit {MAX_1A_COMBOS}).");
+                yield break;
+            }
+
             for (int combo = 0; combo < total; combo++)
             {
                 SolveIterations++;
+
+                // Yield every YIELD_EVERY combos so Unity renders frames
+                if (SolveIterations % YIELD_EVERY == 0)
+                    yield return null;
+
                 var snap = initial.Clone();
                 int tmp = combo;
-
                 for (int i = 0; i < n; i++)
                 {
                     int rotIdx = tmp % 8; tmp /= 8;
@@ -295,50 +340,89 @@ namespace LightPCG.Systems
                             });
                     }
                     Debug.Log($"[AI] {label}: {plan.Count} rotations in {SolveIterations} combos.");
-                    return plan;
+                    _searchResult = plan;
+                    yield break;
                 }
             }
-            return null;
         }
 
         // ────────────────────────────────────────────────────────────
         // RELOCATION SEARCH (Phase 1B)
         // DFS over (object, targetCell, rotation) with beam-score ordering.
         // ────────────────────────────────────────────────────────────
-        List<PlacementAction> RelocationSearch(GridSnapshot initial, Vector2Int receiver)
+        // ════════════════════════════════════════════════════════════
+        // PHASE 1B — BEAM SEARCH (replaces unbounded DFS)
+        //
+        // Why Beam Search instead of DFS:
+        //   DFS pushes every candidate state onto the stack, causing
+        //   memory and node count to grow exponentially for hard levels
+        //   (steps=9, 10 objects → millions of states).
+        //
+        //   Beam Search keeps only the top BEAM_WIDTH states per depth
+        //   level, ranked by beam score. This bounds memory and node
+        //   count to BEAM_WIDTH × maxPlanDepth regardless of difficulty.
+        //
+        //   Trade-off: may miss some solutions that DFS would find, but
+        //   the beam score ordering ensures we explore the most promising
+        //   states first, covering the vast majority of real puzzles.
+        // ════════════════════════════════════════════════════════════
+        private const int BEAM_WIDTH = 64; // top states kept per depth level
+
+        IEnumerator RelocationSearch(GridSnapshot initial, Vector2Int receiver)
         {
-            var visited = new HashSet<string>();
-            var stack = new Stack<(GridSnapshot snap, List<PlacementAction> plan)>();
-            stack.Push((initial, new List<PlacementAction>()));
-
-            while (stack.Count > 0 && SolveIterations < maxSearchNodes)
+            // Each frontier entry: (snapshot, plan so far)
+            var frontier = new List<(GridSnapshot snap, List<PlacementAction> plan)>
             {
-                var (snap, plan) = stack.Pop();
-                SolveIterations++;
+                (initial, new List<PlacementAction>())
+            };
 
-                string key = SnapshotKey(snap);
-                if (visited.Contains(key)) continue;
-                visited.Add(key);
-                if (plan.Count >= maxPlanDepth) continue;
+            for (int depth = 0; depth < maxPlanDepth && frontier.Count > 0; depth++)
+            {
+                // Generate all next states from the current frontier
+                var candidates = new List<(GridSnapshot snap, List<PlacementAction> plan, int score)>();
 
-                var beam = LogicalBeam(snap, receiver);
-                var actions = GenerateRelocateActions(snap, beam, receiver);
-
-                foreach (var action in actions)
+                foreach (var (snap, plan) in frontier)
                 {
-                    var next = ApplyAction(snap, action);
-                    if (LogicalBeamReachesReceiver(next, receiver))
+                    SolveIterations++;
+                    if (SolveIterations % YIELD_EVERY == 0) yield return null;
+                    if (SolveIterations >= maxSearchNodes)
                     {
-                        var fp = new List<PlacementAction>(plan) { action };
-                        Debug.Log($"[AI] 1B: {fp.Count} moves, {SolveIterations} nodes.");
-                        return fp;
+                        Debug.LogWarning($"[AI] 1B node limit hit at depth {depth}.");
+                        yield break;
                     }
-                    if (!visited.Contains(SnapshotKey(next)))
-                        stack.Push((next, new List<PlacementAction>(plan) { action }));
+
+                    var beam = LogicalBeam(snap, receiver);
+                    var actions = GenerateRelocateActions(snap, beam, receiver);
+
+                    foreach (var action in actions)
+                    {
+                        var next = ApplyAction(snap, action);
+
+                        // Goal check
+                        if (LogicalBeamReachesReceiver(next, receiver))
+                        {
+                            _searchResult = new List<PlacementAction>(plan) { action };
+                            Debug.Log($"[AI] 1B (beam): {_searchResult.Count} moves, " +
+                                      $"{SolveIterations} nodes, depth {depth + 1}.");
+                            yield break;
+                        }
+
+                        int score = LogicalBeamScore(next, receiver);
+                        candidates.Add((next, new List<PlacementAction>(plan) { action }, score));
+                    }
                 }
+
+                if (candidates.Count == 0) break;
+
+                // Keep only the top BEAM_WIDTH candidates for the next depth level
+                candidates.Sort((a, b) => b.score.CompareTo(a.score));
+                int keep = Mathf.Min(BEAM_WIDTH, candidates.Count);
+                frontier.Clear();
+                for (int i = 0; i < keep; i++)
+                    frontier.Add((candidates[i].snap, candidates[i].plan));
             }
+
             Debug.LogWarning($"[AI] 1B exhausted after {SolveIterations} nodes.");
-            return null;
         }
 
         List<PlacementAction> GenerateRelocateActions(GridSnapshot snap,
@@ -359,10 +443,15 @@ namespace LightPCG.Systems
                         { SourceCell = src, TargetCell = tgt, ObjType = objType, Rotation = rot });
                 }
 
-            // Sort best-first: highest beam score after applying the action
-            actions.Sort((a, b) =>
-                LogicalBeamScore(ApplyAction(snap, b), receiver)
-                    .CompareTo(LogicalBeamScore(ApplyAction(snap, a), receiver)));
+            // Pre-compute score for each action ONCE, then sort.
+            // Avoids calling LogicalBeam() twice per comparison pair (O(n^2) → O(n)).
+            var scored = new List<(PlacementAction action, int score)>(actions.Count);
+            foreach (var a in actions)
+                scored.Add((a, LogicalBeamScore(ApplyAction(snap, a), receiver)));
+            scored.Sort((x, y) => y.score.CompareTo(x.score));
+
+            actions.Clear();
+            foreach (var (a, _) in scored) actions.Add(a);
             return actions;
         }
 
@@ -558,6 +647,30 @@ namespace LightPCG.Systems
             return next;
         }
 
+        // Use an integer hash instead of string concatenation to reduce GC pressure.
+        // FNV-1a hash over sorted (x, y, type, rot) tuples — fast and collision-resistant
+        // enough for a transposition table of < 100k entries.
+        int SnapshotHash(GridSnapshot snap)
+        {
+            var entries = new List<(int x, int y, int t, int r)>(snap.objects.Count);
+            foreach (var kv in snap.objects)
+                entries.Add((kv.Key.x, kv.Key.y, (int)kv.Value.type, kv.Value.rot));
+            entries.Sort((a, b) => a.x != b.x ? a.x - b.x : a.y != b.y ? a.y - b.y : 0);
+
+            unchecked
+            {
+                int hash = (int)2166136261;
+                foreach (var e in entries)
+                {
+                    hash ^= e.x; hash *= 16777619;
+                    hash ^= e.y; hash *= 16777619;
+                    hash ^= e.t; hash *= 16777619;
+                    hash ^= e.r; hash *= 16777619;
+                }
+                return hash;
+            }
+        }
+
         string SnapshotKey(GridSnapshot snap)
         {
             var parts = snap.objects
@@ -647,28 +760,35 @@ namespace LightPCG.Systems
         // CORRECTION SWEEP (last-resort fallback)
         // Tries all 8 rotations on every object in place.
         // ════════════════════════════════════════════════════════════
+        // ════════════════════════════════════════════════════════════
+        // CORRECTION SWEEP (last-resort fallback)
+        // Uses teleport instead of walking and a shorter wait time
+        // to keep total sweep time under ~10 seconds regardless of
+        // how many objects are on the grid.
+        // ════════════════════════════════════════════════════════════
         IEnumerator CorrectionSweep()
         {
             int[] rots = { 0, 45, 90, 135, 180, 225, 270, 315 };
-            for (int pass = 0; pass < 3 && !RealSolved(); pass++)
+            float fastWait = Mathf.Min(physicsWait, 0.08f);
+
+            foreach (var objCell in GetInteractables())
             {
-                foreach (var objCell in GetInteractables())
+                if (RealSolved()) break;
+                TeleportTo(objCell);
+                yield return new WaitForSeconds(fastWait);
+
+                foreach (int rot in rots)
                 {
-                    if (RealSolved()) break;
-                    yield return StartCoroutine(WalkTo(objCell));
-                    foreach (int rot in rots)
+                    if (gridVisualizer.SpawnedObjects.TryGetValue(objCell, out var go) && go != null)
+                        go.transform.rotation = Quaternion.Euler(0f, rot, 0f);
+                    yield return new WaitForSeconds(fastWait);
+                    if (RealSolved())
                     {
-                        if (gridVisualizer.SpawnedObjects.TryGetValue(objCell, out var go) && go != null)
-                            go.transform.rotation = Quaternion.Euler(0f, rot, 0f);
-                        yield return new WaitForSeconds(physicsWait);
-                        if (RealSolved())
-                        {
-                            ExecutionTimeMs = (Time.realtimeSinceStartup - execStart) * 1000f;
-                            Debug.Log($"[AI] Sweep solved! {rot}°@{objCell}");
-                            Finish(true);
-                            yield return StartCoroutine(ExitDoor());
-                            yield break;
-                        }
+                        ExecutionTimeMs = (Time.realtimeSinceStartup - execStart) * 1000f;
+                        Debug.Log($"[AI] Sweep solved! {rot}°@{objCell}");
+                        Finish(true);
+                        yield return StartCoroutine(ExitDoor());
+                        yield break;
                     }
                 }
             }
@@ -692,7 +812,7 @@ namespace LightPCG.Systems
             {
                 Vector3 dest = gridVisualizer.GridToWorld(step.x, step.y);
                 dest.y = transform.position.y;
-                float timeout = 5f;
+                float timeout = 3f; // reduced from 5f — stuck detection is faster
                 while (timeout > 0f)
                 {
                     timeout -= Time.deltaTime;
@@ -704,6 +824,22 @@ namespace LightPCG.Systems
                     cc.SimpleMove(delta.normalized * moveSpeed);
                     yield return null;
                 }
+
+                // If timeout expired the agent is stuck on a physics collider.
+                // Teleport directly to the step cell to recover.
+                if (timeout <= 0f)
+                {
+                    Debug.LogWarning($"[AI] WalkTo stuck at step {step} — teleporting.");
+                    TeleportTo(step);
+                    yield return new WaitForEndOfFrame();
+                }
+            }
+
+            // Final check: if still not close enough to target, teleport there directly.
+            if (Vector3.Distance(transform.position, wt) > 0.5f)
+            {
+                Debug.LogWarning($"[AI] WalkTo did not reach {target} — teleporting.");
+                TeleportTo(target);
             }
         }
 
@@ -729,8 +865,20 @@ namespace LightPCG.Systems
                 {
                     var next = cur + d;
                     if (!InB(next) || visited.Contains(next)) continue;
+
                     TileType t = grid.GetTile(next.x, next.y);
-                    if (t != TileType.Empty && t != TileType.Door && next != goal) continue;
+                    bool logicallyWalkable = (t == TileType.Empty || t == TileType.Door);
+
+                    // Also block cells that have a live physical object on them
+                    // (mirrors, refractors, etc.) unless it is the goal cell itself.
+                    // This prevents the CharacterController from getting stuck on
+                    // colliders that the logical grid considers passable.
+                    bool hasPhysicalObject = next != goal &&
+                        gridVisualizer.SpawnedObjects.TryGetValue(next, out var obj) &&
+                        obj != null && obj.activeSelf;
+
+                    if ((!logicallyWalkable && next != goal) || hasPhysicalObject) continue;
+
                     visited.Add(next); parent[next] = cur;
                     if (next == goal)
                     {
@@ -823,13 +971,26 @@ namespace LightPCG.Systems
 
         // ════════════════════════════════════════════════════════════
         // REAL LASER CHECK (Unity physics)
+        // Always re-validates the laser array to catch stale references
+        // from destroyed objects in previous levels.
         // ════════════════════════════════════════════════════════════
         bool RealSolved()
         {
-            if (allLasers == null || allLasers.Length == 0) allLasers = FindLaserSystems();
+            // Remove stale (destroyed) references before checking
+            if (allLasers != null)
+            {
+                bool hasStale = false;
+                foreach (var l in allLasers) if (l == null) { hasStale = true; break; }
+                if (hasStale) allLasers = null;
+            }
+
+            if (allLasers == null || allLasers.Length == 0)
+                allLasers = FindLaserSystems();
             if (allLasers.Length == 0) return false;
+
             int hitting = 0;
-            foreach (var l in allLasers) if (l != null && l.IsHittingReceiver) hitting++;
+            foreach (var l in allLasers)
+                if (l != null && l.IsHittingReceiver) hitting++;
             return hitting == allLasers.Length;
         }
 

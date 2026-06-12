@@ -570,7 +570,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 6dda6ad5de5e7be45b99d5f8f79e549a, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  totalRuns: 1000
+  totalRuns: 50
   runOnStart: 1
   startSteps: 2
   maxSteps: 9
@@ -710,12 +710,17 @@ MonoBehaviour:
   rotationSpeed: 15
   physicsWait: 0.15
   stepDelay: 0.25
-  maxBacktrackRounds: 5
-  maxIterations: 50
+  maxSearchNodes: 100000
+  maxPlanDepth: 12
   WasSolved: 0
   SolveIterations: 0
   SolveTimeMs: 0
+  SearchTimeMs: 0
+  ExecutionTimeMs: 0
   TotalPlacements: 0
+  InPlaceRotations: 0
+  Relocations: 0
+  SolvePhase: None
 --- !u!143 &1901820499
 CharacterController:
   m_ObjectHideFlags: 0
@@ -753,7 +758,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 6dda6ad5de5e7be45b99d5f8f79e549a, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  totalRuns: 1000
+  totalRuns: 50
   runOnStart: 1
   startSteps: 2
   maxSteps: 9

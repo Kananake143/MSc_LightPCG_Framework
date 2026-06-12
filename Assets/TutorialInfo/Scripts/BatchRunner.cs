@@ -9,31 +9,13 @@ namespace LightPCG.Research
 {
     /// <summary>
     /// Runs N automated solve attempts and exports results to CSV.
-    ///
-    /// CSV columns (grouped by concern):
-    ///
-    ///   Identification
-    ///     Run, Level
-    ///
-    ///   Puzzle structure (from PCG generator)
-    ///     Steps, SolutionObjects, Decoys, TotalObjects, GridWidth, GridHeight, MID
-    ///
-    ///   Solver outcome
-    ///     Solved, SolvePhase
-    ///
-    ///   Search performance (logical, no physics wait)
-    ///     SearchNodes, SearchTimeMs
-    ///
-    ///   Execution performance (physical movement)
-    ///     TotalPlacements, InPlaceRotations, Relocations, ExecutionTimeMs
-    ///
-    ///   Overall timing
-    ///     SolveTimeMs, GenerationTimeMs
+    /// Set totalRuns in the Inspector before pressing Play.
+    /// CSV is saved to: [Project]/Assets/PCG_Results.csv
     /// </summary>
     public class BatchRunner : MonoBehaviour
     {
         [Header("Experiment")]
-        public int totalRuns = 50;
+        public int totalRuns = 50;   // change to 1000 for full experiment
         public bool runOnStart = true;
 
         [Header("Progressive Difficulty")]
@@ -50,7 +32,7 @@ namespace LightPCG.Research
         public string csvFileName = "PCG_Results.csv";
 
         [Header("Timing")]
-        [Tooltip("Seconds to wait after OnSolveComplete before generating next level.")]
+        [Tooltip("Seconds to wait after OnSolveComplete before generating the next level.")]
         public float exitDoorWait = 5.0f;
 
         // ── Private state ─────────────────────────────────────────
@@ -60,13 +42,13 @@ namespace LightPCG.Research
         private int currentDecoys;
         private int solvedInSession = 0;
 
-        // ── Record layout ─────────────────────────────────────────
+        // ── Full record layout (synced with AISolverAgent fields) ─
         struct RunRecord
         {
             // Identification
             public int run, level;
 
-            // Puzzle structure
+            // Puzzle structure (from PCG generator)
             public int steps, solObjs, decoys, totalObjs, gridWidth, gridHeight;
             public float mid;
 
@@ -74,11 +56,11 @@ namespace LightPCG.Research
             public bool solved;
             public string solvePhase;
 
-            // Search performance
+            // Search performance (logical only, no physics wait)
             public int searchNodes;
             public float searchTimeMs;
 
-            // Execution performance
+            // Execution performance (physical movement)
             public int totalPlacements, inPlaceRotations, relocations;
             public float execTimeMs;
 
@@ -104,12 +86,13 @@ namespace LightPCG.Research
             Debug.Log($"[Batch] Starting {totalRuns} runs | initialSteps={startSteps}");
             records.Clear();
             currentRun = 0;
+            solvedInSession = 0;
 
             for (int i = 0; i < totalRuns; i++)
             {
                 currentRun = i + 1;
 
-                // Apply difficulty to generator
+                // Apply difficulty
                 gridVisualizer.minSteps = currentSteps;
                 gridVisualizer.maxSteps = currentSteps;
                 gridVisualizer.decoyCount = currentDecoys;
@@ -125,16 +108,16 @@ namespace LightPCG.Research
                 yield return new WaitForEndOfFrame();
                 yield return new WaitForSeconds(0.3f);
 
-                // Run solver
+                // Run solver and wait for completion
                 bool waiting = true;
                 solverAgent.OnSolveComplete = _ => { waiting = false; };
                 solverAgent.StartSolve();
                 while (waiting) yield return null;
 
-                // Wait for agent to finish walking out the door
+                // Wait for agent to finish walking through the door
                 yield return new WaitForSeconds(exitDoorWait);
 
-                // Collect all metrics
+                // ── Collect all metrics ──
                 bool solved = solverAgent.WasSolved;
                 int gw = gridVisualizer.desiredWidth;
                 int gh = gridVisualizer.desiredHeight;
@@ -174,6 +157,7 @@ namespace LightPCG.Research
                     genMs = gMs
                 });
 
+                // Update difficulty on success
                 if (solved)
                 {
                     solvedInSession++;
@@ -182,12 +166,13 @@ namespace LightPCG.Research
                     Debug.Log($"[Batch] Solved! Next steps={currentSteps} decoys={currentDecoys}");
                 }
 
-                // Periodic progress log every 50 runs
-                if (currentRun % 50 == 0)
+                // Progress log every 10 runs
+                if (currentRun % 10 == 0)
                 {
                     int s = 0; foreach (var r in records) if (r.solved) s++;
-                    Debug.Log($"[Batch] {currentRun}/{totalRuns} " +
-                              $"Rate={s * 100f / records.Count:F1}% Steps={currentSteps}");
+                    Debug.Log($"[Batch] Progress {currentRun}/{totalRuns} | " +
+                              $"SolveRate={s * 100f / records.Count:F1}% | " +
+                              $"Steps={currentSteps} Decoys={currentDecoys}");
                 }
 
                 yield return new WaitForSeconds(0.1f);
@@ -201,55 +186,48 @@ namespace LightPCG.Research
         {
             var sb = new StringBuilder();
 
-            // Header — grouped by concern for readability in spreadsheet tools
+            // Header
             sb.AppendLine(
-                // Identification
                 "Run,Level," +
-                // Puzzle structure
                 "Steps,SolutionObjects,Decoys,TotalObjects,GridWidth,GridHeight,MID," +
-                // Solver outcome
                 "Solved,SolvePhase," +
-                // Search performance (logical, no physics wait)
                 "SearchNodes,SearchTimeMs," +
-                // Execution performance (physical movement)
                 "TotalPlacements,InPlaceRotations,Relocations,ExecutionTimeMs," +
-                // Overall timing
                 "SolveTimeMs,GenerationTimeMs");
 
             foreach (var r in records)
                 sb.AppendLine(
-                    // Identification
                     $"{r.run},{r.level}," +
-                    // Puzzle structure
                     $"{r.steps},{r.solObjs},{r.decoys},{r.totalObjs}," +
                     $"{r.gridWidth},{r.gridHeight},{r.mid:F4}," +
-                    // Solver outcome
                     $"{(r.solved ? 1 : 0)},{r.solvePhase}," +
-                    // Search performance
                     $"{r.searchNodes},{r.searchTimeMs:F2}," +
-                    // Execution performance
                     $"{r.totalPlacements},{r.inPlaceRotations},{r.relocations},{r.execTimeMs:F2}," +
-                    // Overall timing
                     $"{r.solveTimeMs:F2},{r.genMs:F2}");
 
+            // Save to Assets folder
             string path = Path.Combine(Application.dataPath, csvFileName);
             File.WriteAllText(path, sb.ToString());
 
+            // Summary log
             int solved2 = 0; foreach (var r in records) if (r.solved) solved2++;
-
-            // Summary by solve phase
-            int phase1A = 0, phase1B = 0, sweep = 0, none = 0;
+            int p1a = 0, p1b = 0, sweep = 0, none = 0, trivial = 0;
             foreach (var r in records)
             {
-                if (r.solvePhase == "1A") phase1A++;
-                else if (r.solvePhase == "1B") phase1B++;
-                else if (r.solvePhase == "Sweep") sweep++;
-                else none++;
+                switch (r.solvePhase)
+                {
+                    case "1A": p1a++; break;
+                    case "1B": p1b++; break;
+                    case "Sweep": sweep++; break;
+                    case "Trivial": trivial++; break;
+                    default: none++; break;
+                }
             }
 
-            Debug.Log($"[Batch] COMPLETE {solved2}/{records.Count} solved | " +
-                      $"Phase1A={phase1A} Phase1B={phase1B} Sweep={sweep} Failed={none} | " +
-                      $"CSV: {path}");
+            Debug.Log($"[Batch] ══ COMPLETE ══ {solved2}/{records.Count} solved\n" +
+                      $"  Phase breakdown — Trivial:{trivial} 1A:{p1a} 1B:{p1b} " +
+                      $"Sweep:{sweep} Failed:{none}\n" +
+                      $"  CSV saved to: {path}");
         }
     }
 }

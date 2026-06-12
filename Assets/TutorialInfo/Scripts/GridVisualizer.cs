@@ -65,6 +65,12 @@ namespace LightPCG.Systems
             LastDecoyCount = pcg.DecoyCount;
             LastTotalObjectCount = pcg.TotalObjectCount;
             BuildVisuals();
+
+            // Reset all ReceiverDetectors so doorOpened / hitTimer from the
+            // previous level do not carry over into the new level.
+            foreach (var rd in GetComponentsInChildren<ReceiverDetector>())
+                rd.ResetState();
+
             Debug.Log($"[GridVisualizer] Level ready steps={LastSteps} " +
                       $"solutionObjs={LastSolutionObjectCount} decoys={LastDecoyCount}");
         }
