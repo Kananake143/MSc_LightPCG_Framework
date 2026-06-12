@@ -33,7 +33,7 @@ namespace LightPCG.Research
     public class BatchRunner : MonoBehaviour
     {
         [Header("Experiment")]
-        public int totalRuns = 1000;
+        public int totalRuns = 50;
         public bool runOnStart = true;
 
         [Header("Progressive Difficulty")]
