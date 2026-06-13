@@ -137,6 +137,7 @@ namespace LightPCG.Systems
             SolvePhase = "None";
             allLasers = null;
             _searchResult = null;
+            _searchDone = false;
             solveStart = searchStart = execStart = 0f;
 
             // Update grid reference immediately (before first coroutine yield)
@@ -157,45 +158,49 @@ namespace LightPCG.Systems
             yield return new WaitForEndOfFrame();
             yield return new WaitForSeconds(0.5f);
 
-            // Re-assign grid here after the initial wait, in case the visualiser
-            // regenerated the level between StartSolve() and this point.
             grid = gridVisualizer.LevelGrid;
             spacing = gridVisualizer.Spacing;
             allLasers = FindLaserSystems();
             solveStart = Time.realtimeSinceStartup;
 
             Vector2Int em = FindFirst(TileType.Emitter);
-            if (em == -Vector2Int.one) { Debug.LogError("[AI] No Emitter!"); Finish(false); yield break; }
+            if (em == -Vector2Int.one)
+            {
+                Debug.LogError("[AI] No Emitter!");
+                execStart = Time.realtimeSinceStartup;
+                Finish(false); yield break;
+            }
 
             TeleportTo(em);
             yield return new WaitForSeconds(0.3f);
 
-            if (RealSolved()) { SolvePhase = "Trivial"; Finish(true); yield return StartCoroutine(ExitDoor()); yield break; }
+            if (RealSolved())
+            {
+                SolvePhase = "Trivial";
+                execStart = Time.realtimeSinceStartup;
+                Finish(true);
+                yield return StartCoroutine(ExitDoor());
+                yield break;
+            }
 
-            // ── Phase 1: logical search (coroutine — yields to Unity every YIELD_EVERY iters) ──
+            // ── Phase 1: logical search with hard wall-clock timeout ──
             searchStart = Time.realtimeSinceStartup;
             _searchResult = null;
+            _searchDone = false;
+            StartCoroutine(RunSearchWithDoneFlag());
 
-            // Run search as a coroutine with a wall-clock timeout.
-            // If the search hasn't finished within MAX_SEARCH_SECONDS,
-            // abandon it and fall through to the sweep fallback.
-            // This prevents the bot from appearing frozen on very hard levels.
-            bool searchDone = false;
-            StartCoroutine(RunSearchWithFlag(() => searchDone = true));
-            float searchDeadline = Time.realtimeSinceStartup + MAX_SEARCH_SECONDS;
-            while (!searchDone && Time.realtimeSinceStartup < searchDeadline)
+            float deadline = Time.realtimeSinceStartup + MAX_SEARCH_SECONDS;
+            while (!_searchDone && Time.realtimeSinceStartup < deadline)
                 yield return null;
 
-            if (!searchDone)
-            {
+            if (!_searchDone)
                 Debug.LogWarning($"[AI] Search timeout after {MAX_SEARCH_SECONDS}s — going to sweep.");
-                StopCoroutine("LogicalSearch"); // best-effort stop
-            }
 
             SearchTimeMs = (Time.realtimeSinceStartup - searchStart) * 1000f;
 
             // ── Phase 2: physical execution ──
             execStart = Time.realtimeSinceStartup;
+
             if (_searchResult != null)
                 yield return StartCoroutine(ExecutePlan(_searchResult));
             else
@@ -204,14 +209,14 @@ namespace LightPCG.Systems
                 Debug.LogWarning("[AI] Logical search exhausted — sweep fallback.");
                 yield return StartCoroutine(CorrectionSweep());
             }
-        }
 
-        // Helper: runs LogicalSearch and sets a flag when done,
-        // so the Pipeline can monitor it with a timeout.
-        IEnumerator RunSearchWithFlag(System.Action onDone)
-        {
-            yield return StartCoroutine(LogicalSearch());
-            onDone?.Invoke();
+            // Safety net: guarantee Finish() is always called
+            if (running)
+            {
+                Debug.LogWarning("[AI] Pipeline ended without Finish() — forcing Finish(false).");
+                SolvePhase = "None";
+                Finish(false);
+            }
         }
 
         // ════════════════════════════════════════════════════════════
@@ -220,8 +225,15 @@ namespace LightPCG.Systems
         // Yields every YIELD_EVERY iterations so the main thread renders frames.
         // ════════════════════════════════════════════════════════════
         private List<PlacementAction> _searchResult;
-        private const int YIELD_EVERY = 500;  // yield to Unity every N iterations
-        private const float MAX_SEARCH_SECONDS = 8f; // hard wall-clock limit for all search
+        private bool _searchDone = false;
+        private const int YIELD_EVERY = 200;
+        private const float MAX_SEARCH_SECONDS = 8f;
+
+        IEnumerator RunSearchWithDoneFlag()
+        {
+            yield return StartCoroutine(LogicalSearch());
+            _searchDone = true;
+        }
 
         IEnumerator LogicalSearch()
         {
@@ -276,18 +288,9 @@ namespace LightPCG.Systems
         // ────────────────────────────────────────────────────────────
         // ROTATION SEARCH
         // Enumerate all rotation combinations for a given object subset.
-        //
-        // Hard cap: refuse to search more than MAX_1A_COMBOS combinations.
-        // With 8 rotations per object:
-        //   n=1 →       8 combos   (instant)
-        //   n=2 →      64 combos   (instant)
-        //   n=3 →     512 combos   (~1ms)
-        //   n=4 →    4096 combos   (~5ms)
-        //   n=5 →   32768 combos   (~50ms)  ← upper limit for 1A
-        //   n=6 → 262144 combos   (would freeze for several seconds)
+        // Only objects whose rotation differs from initial are included
+        // in the returned plan (no-op rotations are omitted).
         // ────────────────────────────────────────────────────────────
-        private const int MAX_1A_COMBOS = 32768; // = 8^5, hard ceiling for rotation search
-
         IEnumerator RotationSearch(
             GridSnapshot initial,
             List<(Vector2Int cell, TileType type)> objects,
@@ -297,13 +300,6 @@ namespace LightPCG.Systems
             int[] rots = { 0, 45, 90, 135, 180, 225, 270, 315 };
             int n = objects.Count;
             int total = (int)Mathf.Pow(8, n);
-
-            // Skip if too many combinations — fall through to beam search (1B)
-            if (total > MAX_1A_COMBOS)
-            {
-                Debug.Log($"[AI] {label}: skipped ({total} combos > limit {MAX_1A_COMBOS}).");
-                yield break;
-            }
 
             for (int combo = 0; combo < total; combo++)
             {
@@ -758,42 +754,110 @@ namespace LightPCG.Systems
 
         // ════════════════════════════════════════════════════════════
         // CORRECTION SWEEP (last-resort fallback)
-        // Tries all 8 rotations on every object in place.
-        // ════════════════════════════════════════════════════════════
-        // ════════════════════════════════════════════════════════════
-        // CORRECTION SWEEP (last-resort fallback)
-        // Uses teleport instead of walking and a shorter wait time
-        // to keep total sweep time under ~10 seconds regardless of
-        // how many objects are on the grid.
+        //
+        // S1 — Rotate on-beam objects only (fast, targeted):
+        //   Simulate beam → try all 8 rotations on objects the beam
+        //   currently passes through → re-simulate after each pass.
+        //   Stop early when no object improves the beam score.
+        //
+        // S3 — Rotate all objects (final fallback):
+        //   If S1 makes no progress, rotate every object including
+        //   off-beam ones to cover remaining edge cases.
         // ════════════════════════════════════════════════════════════
         IEnumerator CorrectionSweep()
         {
-            int[] rots = { 0, 45, 90, 135, 180, 225, 270, 315 };
             float fastWait = Mathf.Min(physicsWait, 0.08f);
+            int[] rots = { 0, 45, 90, 135, 180, 225, 270, 315 };
+            var receiver = FindFirst(TileType.Receiver);
 
-            foreach (var objCell in GetInteractables())
+            var allObjects = GetInteractables();
+            if (allObjects.Count == 0)
             {
-                if (RealSolved()) break;
-                TeleportTo(objCell);
-                yield return new WaitForSeconds(fastWait);
+                Debug.LogWarning("[AI] Sweep: no interactable objects.");
+                ExecutionTimeMs = (Time.realtimeSinceStartup - execStart) * 1000f;
+                Finish(RealSolved());
+                yield break;
+            }
 
-                foreach (int rot in rots)
+            // ── S1: rotate on-beam objects only ──
+            Debug.Log("[AI] Sweep S1: on-beam rotation.");
+            for (int pass = 0; pass < 5 && !RealSolved(); pass++)
+            {
+                var beam = LogicalBeam(SnapshotGrid(), receiver);
+                var candidates = allObjects
+                    .Where(c => beam.pathSet.Contains(c))
+                    .OrderBy(c => Manhattan(c, receiver))
+                    .ToList();
+
+                if (candidates.Count == 0) break;
+
+                bool improved = false;
+                foreach (var objCell in candidates)
                 {
-                    if (gridVisualizer.SpawnedObjects.TryGetValue(objCell, out var go) && go != null)
-                        go.transform.rotation = Quaternion.Euler(0f, rot, 0f);
+                    if (RealSolved()) break;
+                    TeleportTo(objCell);
                     yield return new WaitForSeconds(fastWait);
-                    if (RealSolved())
+
+                    int baseScore = ScoreBeamLogical();
+                    foreach (int rot in rots)
                     {
-                        ExecutionTimeMs = (Time.realtimeSinceStartup - execStart) * 1000f;
-                        Debug.Log($"[AI] Sweep solved! {rot}°@{objCell}");
-                        Finish(true);
-                        yield return StartCoroutine(ExitDoor());
-                        yield break;
+                        if (gridVisualizer.SpawnedObjects.TryGetValue(objCell, out var go) && go != null)
+                            go.transform.rotation = Quaternion.Euler(0f, rot, 0f);
+                        yield return new WaitForSeconds(fastWait);
+
+                        if (RealSolved())
+                        {
+                            ExecutionTimeMs = (Time.realtimeSinceStartup - execStart) * 1000f;
+                            Debug.Log($"[AI] S1 solved! {rot}°@{objCell} pass={pass + 1}");
+                            Finish(true);
+                            yield return StartCoroutine(ExitDoor());
+                            yield break;
+                        }
+                        if (ScoreBeamLogical() > baseScore) { improved = true; break; }
+                    }
+                }
+                if (!improved) break;
+            }
+
+            // ── S3: rotate all objects (final fallback) ──
+            if (!RealSolved())
+            {
+                Debug.Log("[AI] Sweep S3: rotating all objects.");
+                foreach (var objCell in allObjects)
+                {
+                    if (RealSolved()) break;
+                    TeleportTo(objCell);
+                    yield return new WaitForSeconds(fastWait);
+
+                    foreach (int rot in rots)
+                    {
+                        if (gridVisualizer.SpawnedObjects.TryGetValue(objCell, out var go) && go != null)
+                            go.transform.rotation = Quaternion.Euler(0f, rot, 0f);
+                        yield return new WaitForSeconds(fastWait);
+
+                        if (RealSolved())
+                        {
+                            ExecutionTimeMs = (Time.realtimeSinceStartup - execStart) * 1000f;
+                            Debug.Log($"[AI] S3 solved! {rot}°@{objCell}");
+                            Finish(true);
+                            yield return StartCoroutine(ExitDoor());
+                            yield break;
+                        }
                     }
                 }
             }
+
             ExecutionTimeMs = (Time.realtimeSinceStartup - execStart) * 1000f;
             if (!RealSolved()) { Debug.LogWarning("[AI] All phases failed."); Finish(false); }
+        }
+
+        // Score current beam using logical grid simulation.
+        int ScoreBeamLogical()
+        {
+            var receiver = FindFirst(TileType.Receiver);
+            var b = LogicalBeam(SnapshotGrid(), receiver);
+            if (b.hitReceiver) return int.MaxValue;
+            return b.path.Count - Manhattan(b.endCell, receiver) * 2;
         }
 
         // ════════════════════════════════════════════════════════════

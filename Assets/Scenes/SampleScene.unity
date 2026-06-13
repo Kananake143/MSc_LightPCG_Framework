@@ -579,7 +579,7 @@ MonoBehaviour:
   gridVisualizer: {fileID: 0}
   solverAgent: {fileID: 0}
   csvFileName: PCG_Results.csv
-  exitDoorWait: 3.5
+  exitDoorWait: 2
 --- !u!1 &1901820493
 GameObject:
   m_ObjectHideFlags: 0
@@ -767,7 +767,7 @@ MonoBehaviour:
   gridVisualizer: {fileID: 0}
   solverAgent: {fileID: 0}
   csvFileName: PCG_Results.csv
-  exitDoorWait: 3.5
+  exitDoorWait: 2
 --- !u!1660057539 &9223372036854775807
 SceneRoots:
   m_ObjectHideFlags: 0
