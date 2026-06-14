@@ -23,7 +23,7 @@
 *   Explore and implement **Backward Chaining** to improve the efficiency and quality of the generated puzzles.
 
 ---
-Week 2 (11 June 2026)
+### Week 2 (11 June 2026)
 
 **Key Achievements:**
 
