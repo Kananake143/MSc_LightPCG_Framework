@@ -7,18 +7,29 @@ using LightPCG.Core;
 namespace LightPCG.Systems
 {
     /// <summary>
-    /// Backtracking Search Solver v3
+    /// Backtracking Search Solver v4
     ///
-    /// Core fix: Phase 1A now separates objects INTO two groups before searching:
-    ///   - "on-beam" objects: those the initial beam already passes through
-    ///   - "off-beam" objects: decoys that are not on the beam path
+    /// Strategy (Phase 1 — Logical search):
+    ///   1A-OnBeam  : try all rotation combos for on-beam objects only
+    ///   1A-Full    : try all rotation combos for ALL objects (fallback)
+    ///   1B         : beam-guided relocation search
     ///
-    /// Strategy:
-    ///   1A-OnBeam  : try all rotation combos for on-beam objects only (small n → fast)
-    ///   1A-Full    : try all rotation combos for ALL objects (fallback if above fails)
-    ///   1B         : relocation DFS for decoys blocking the path
-    ///   Phase 2    : physically execute the verified plan in proximity order
-    ///   Sweep      : last-resort in-place rotation sweep
+    /// Strategy (Phase 2 — Physical execution):
+    ///   ExecutePlan → CorrectionSweep (if plan fails under physics)
+    ///
+    /// CorrectionSweep v4 — three targeted stages:
+    ///   S1 : Rotate on-beam objects only (fast, beam-guided)
+    ///   S2 : Relocate off-beam objects INTO beam path, then retry S1
+    ///        ← NEW: handles the "beam hits no objects" edge case
+    ///        ← replaces old S3 random-rotate-all which was unguided
+    ///   S3 : Exhaustive rotate-all fallback (kept as last resort only)
+    ///
+    /// Key fix vs v3:
+    ///   Old S3 rotated every object including decoys outside the beam,
+    ///   which cannot redirect light and only wasted time or solved by accident.
+    ///   New S2 detects beam-too-short / no-on-beam-object situations and
+    ///   physically moves one off-beam object into the beam path before
+    ///   re-running S1. This makes every Sweep action purposeful.
     /// </summary>
     [RequireComponent(typeof(CharacterController))]
     public class AISolverAgent : MonoBehaviour
@@ -38,7 +49,7 @@ namespace LightPCG.Systems
         public int maxSearchNodes = 100000;
         public int maxPlanDepth = 12;
 
-        // ── Public stats (read by BatchRunner) ───────────────────
+        // ── Public stats (read by BatchRunner) ────────────────────
         [HideInInspector] public bool WasSolved;
         [HideInInspector] public int SolveIterations;
         [HideInInspector] public float SolveTimeMs;
@@ -51,7 +62,7 @@ namespace LightPCG.Systems
 
         public System.Action<bool> OnSolveComplete;
 
-        // ── Private ──────────────────────────────────────────────
+        // ── Private ───────────────────────────────────────────────
         private GridModel grid;
         private float spacing;
         private CharacterController cc;
@@ -67,9 +78,6 @@ namespace LightPCG.Systems
         // ════════════════════════════════════════════════════════════
         // DATA STRUCTURES
         // ════════════════════════════════════════════════════════════
-
-        /// One action in the solution plan.
-        /// SourceCell == TargetCell → in-place rotation (no pickup needed).
         struct PlacementAction
         {
             public Vector2Int SourceCell;
@@ -79,7 +87,6 @@ namespace LightPCG.Systems
             public bool IsRotateOnly => SourceCell == TargetCell;
         }
 
-        /// Logical grid state for the search (mirrors/refractors only).
         struct GridSnapshot
         {
             public Dictionary<Vector2Int, (TileType type, int rot)> objects;
@@ -90,8 +97,8 @@ namespace LightPCG.Systems
 
         struct LogicalBeamResult
         {
-            public List<Vector2Int> path;      // every cell the beam visits
-            public HashSet<Vector2Int> pathSet; // fast lookup
+            public List<Vector2Int> path;
+            public HashSet<Vector2Int> pathSet;
             public Vector2Int endCell;
             public bool hitReceiver;
         }
@@ -118,17 +125,12 @@ namespace LightPCG.Systems
 
         // ════════════════════════════════════════════════════════════
         // PUBLIC ENTRY POINT
-        // Full reset every call — no memory from previous level survives.
         // ════════════════════════════════════════════════════════════
         public void StartSolve()
         {
-            // Stop any coroutines still running from the previous level.
-            // Do NOT use "if (running) return" — that would block a new level
-            // from starting if the previous run ended abnormally without calling Finish().
             StopAllCoroutines();
-            running = false; // will be set true below after full reset
+            running = false;
 
-            // ── Reset every stat and state field ──
             running = true;
             WasSolved = false;
             SolveIterations = 0;
@@ -140,7 +142,6 @@ namespace LightPCG.Systems
             _searchDone = false;
             solveStart = searchStart = execStart = 0f;
 
-            // Update grid reference immediately (before first coroutine yield)
             if (gridVisualizer != null)
             {
                 grid = gridVisualizer.LevelGrid;
@@ -183,7 +184,7 @@ namespace LightPCG.Systems
                 yield break;
             }
 
-            // ── Phase 1: logical search with hard wall-clock timeout ──
+            // ── Phase 1: logical search ──
             searchStart = Time.realtimeSinceStartup;
             _searchResult = null;
             _searchDone = false;
@@ -210,7 +211,6 @@ namespace LightPCG.Systems
                 yield return StartCoroutine(CorrectionSweep());
             }
 
-            // Safety net: guarantee Finish() is always called
             if (running)
             {
                 Debug.LogWarning("[AI] Pipeline ended without Finish() — forcing Finish(false).");
@@ -220,9 +220,7 @@ namespace LightPCG.Systems
         }
 
         // ════════════════════════════════════════════════════════════
-        // LOGICAL SEARCH — coroutine so Unity stays responsive
-        // Result written to _searchResult (IEnumerator cannot return values).
-        // Yields every YIELD_EVERY iterations so the main thread renders frames.
+        // LOGICAL SEARCH
         // ════════════════════════════════════════════════════════════
         private List<PlacementAction> _searchResult;
         private bool _searchDone = false;
@@ -255,9 +253,6 @@ namespace LightPCG.Systems
             }
             Debug.Log($"[AI] Objects: {onBeam.Count} on-beam, {offBeam.Count} off-beam.");
 
-            // If beam reaches no objects at all (beam hits wall immediately),
-            // skip 1A entirely — no rotation will help — go straight to 1B
-            // which can relocate objects INTO the beam path.
             if (onBeam.Count == 0 && offBeam.Count > 0)
             {
                 Debug.LogWarning("[AI] 0 on-beam objects — beam too short. Skipping 1A, going to 1B.");
@@ -285,12 +280,7 @@ namespace LightPCG.Systems
             if (_searchResult != null) SolvePhase = "1B";
         }
 
-        // ────────────────────────────────────────────────────────────
-        // ROTATION SEARCH
-        // Enumerate all rotation combinations for a given object subset.
-        // Only objects whose rotation differs from initial are included
-        // in the returned plan (no-op rotations are omitted).
-        // ────────────────────────────────────────────────────────────
+        // ── Rotation Search ───────────────────────────────────────
         IEnumerator RotationSearch(
             GridSnapshot initial,
             List<(Vector2Int cell, TileType type)> objects,
@@ -304,10 +294,7 @@ namespace LightPCG.Systems
             for (int combo = 0; combo < total; combo++)
             {
                 SolveIterations++;
-
-                // Yield every YIELD_EVERY combos so Unity renders frames
-                if (SolveIterations % YIELD_EVERY == 0)
-                    yield return null;
+                if (SolveIterations % YIELD_EVERY == 0) yield return null;
 
                 var snap = initial.Clone();
                 int tmp = combo;
@@ -342,31 +329,11 @@ namespace LightPCG.Systems
             }
         }
 
-        // ────────────────────────────────────────────────────────────
-        // RELOCATION SEARCH (Phase 1B)
-        // DFS over (object, targetCell, rotation) with beam-score ordering.
-        // ────────────────────────────────────────────────────────────
-        // ════════════════════════════════════════════════════════════
-        // PHASE 1B — BEAM SEARCH (replaces unbounded DFS)
-        //
-        // Why Beam Search instead of DFS:
-        //   DFS pushes every candidate state onto the stack, causing
-        //   memory and node count to grow exponentially for hard levels
-        //   (steps=9, 10 objects → millions of states).
-        //
-        //   Beam Search keeps only the top BEAM_WIDTH states per depth
-        //   level, ranked by beam score. This bounds memory and node
-        //   count to BEAM_WIDTH × maxPlanDepth regardless of difficulty.
-        //
-        //   Trade-off: may miss some solutions that DFS would find, but
-        //   the beam score ordering ensures we explore the most promising
-        //   states first, covering the vast majority of real puzzles.
-        // ════════════════════════════════════════════════════════════
-        private const int BEAM_WIDTH = 64; // top states kept per depth level
+        // ── Relocation Search (1B) ────────────────────────────────
+        private const int BEAM_WIDTH = 64;
 
         IEnumerator RelocationSearch(GridSnapshot initial, Vector2Int receiver)
         {
-            // Each frontier entry: (snapshot, plan so far)
             var frontier = new List<(GridSnapshot snap, List<PlacementAction> plan)>
             {
                 (initial, new List<PlacementAction>())
@@ -374,7 +341,6 @@ namespace LightPCG.Systems
 
             for (int depth = 0; depth < maxPlanDepth && frontier.Count > 0; depth++)
             {
-                // Generate all next states from the current frontier
                 var candidates = new List<(GridSnapshot snap, List<PlacementAction> plan, int score)>();
 
                 foreach (var (snap, plan) in frontier)
@@ -393,8 +359,6 @@ namespace LightPCG.Systems
                     foreach (var action in actions)
                     {
                         var next = ApplyAction(snap, action);
-
-                        // Goal check
                         if (LogicalBeamReachesReceiver(next, receiver))
                         {
                             _searchResult = new List<PlacementAction>(plan) { action };
@@ -402,15 +366,12 @@ namespace LightPCG.Systems
                                       $"{SolveIterations} nodes, depth {depth + 1}.");
                             yield break;
                         }
-
                         int score = LogicalBeamScore(next, receiver);
                         candidates.Add((next, new List<PlacementAction>(plan) { action }, score));
                     }
                 }
 
                 if (candidates.Count == 0) break;
-
-                // Keep only the top BEAM_WIDTH candidates for the next depth level
                 candidates.Sort((a, b) => b.score.CompareTo(a.score));
                 int keep = Mathf.Min(BEAM_WIDTH, candidates.Count);
                 frontier.Clear();
@@ -427,10 +388,10 @@ namespace LightPCG.Systems
         {
             var actions = new List<PlacementAction>();
             var objList = snap.objects.Select(kv => (kv.Key, kv.Value.type)).ToList();
-            var candidates = LogicalCandidates(snap, beam, receiver);
+            var cands = LogicalCandidates(snap, beam, receiver);
 
             foreach (var (src, objType) in objList)
-                foreach (var tgt in candidates)
+                foreach (var tgt in cands)
                 {
                     if (tgt == src || snap.objects.ContainsKey(tgt)) continue;
                     var inDir = LogicalIncomingDir(snap, tgt, beam);
@@ -439,8 +400,6 @@ namespace LightPCG.Systems
                         { SourceCell = src, TargetCell = tgt, ObjType = objType, Rotation = rot });
                 }
 
-            // Pre-compute score for each action ONCE, then sort.
-            // Avoids calling LogicalBeam() twice per comparison pair (O(n^2) → O(n)).
             var scored = new List<(PlacementAction action, int score)>(actions.Count);
             foreach (var a in actions)
                 scored.Add((a, LogicalBeamScore(ApplyAction(snap, a), receiver)));
@@ -452,9 +411,295 @@ namespace LightPCG.Systems
         }
 
         // ════════════════════════════════════════════════════════════
+        // CORRECTION SWEEP v4
+        //
+        // S1 — Rotate on-beam objects (unchanged from v3, fast)
+        //
+        // S2 — NEW: Beam-guided relocation
+        //   Detects when beam hits no interactable objects at all
+        //   (beam too short OR all objects are off-beam).
+        //   Picks the best off-beam object, physically moves it to
+        //   the nearest empty cell on the beam path, then re-runs S1.
+        //   Repeats up to MAX_S2_RELOCATIONS times.
+        //   Rationale: rotating an object outside the beam path can
+        //   never redirect light — relocation is the only meaningful action.
+        //
+        // S3 — Exhaustive rotate-all (last resort, kept for completeness)
+        //   Only reached when S1 and S2 both fail. Limited to
+        //   MAX_S3_OBJECTS to avoid spending minutes on unsolvable states.
+        // ════════════════════════════════════════════════════════════
+        
+        
+        IEnumerator CorrectionSweep()
+        {
+            int totalObjs = gridVisualizer.LastTotalObjectCount;
+            int MAX_S2_RELOCATIONS = Mathf.Clamp(totalObjs / 3, 2, 6);
+            int MAX_S3_OBJECTS = Mathf.Clamp(totalObjs, 4, 10);
+
+            
+            float fastWait = Mathf.Min(physicsWait, 0.08f);
+            int[] rots = { 0, 45, 90, 135, 180, 225, 270, 315 };
+            Vector2Int receiver = FindFirst(TileType.Receiver);
+
+            var allObjects = GetInteractables();
+            if (allObjects.Count == 0)
+            {
+                Debug.LogWarning("[AI] Sweep: no interactable objects.");
+                ExecutionTimeMs = (Time.realtimeSinceStartup - execStart) * 1000f;
+                Finish(RealSolved());
+                yield break;
+            }
+
+            // ── S1: rotate on-beam objects ────────────────────────
+            Debug.Log("[AI] Sweep S1: on-beam rotation.");
+            yield return StartCoroutine(SweepS1(allObjects, receiver, rots, fastWait));
+            if (RealSolved()) yield break;
+
+            // ── S2: relocate off-beam object into beam path ───────
+            // Triggered when beam contacts no interactable object at all.
+            Debug.Log("[AI] Sweep S2: beam-guided relocation of off-beam objects.");
+            for (int attempt = 0; attempt < MAX_S2_RELOCATIONS && !RealSolved(); attempt++)
+            {
+                var snap = SnapshotGrid();
+                var beam = LogicalBeam(snap, receiver);
+
+                // Check: are there any on-beam interactable objects?
+                bool hasOnBeam = allObjects.Any(c => beam.pathSet.Contains(c));
+                if (hasOnBeam)
+                {
+                    // beam already touches something — re-run S1 instead
+                    yield return StartCoroutine(SweepS1(allObjects, receiver, rots, fastWait));
+                    if (RealSolved()) yield break;
+                    break; // S1 made no progress either — fall through to S3
+                }
+
+                // Find empty cells along the beam path to receive a relocated object
+                var beamEmptyCells = beam.path
+                    .Where(c => grid.GetTile(c.x, c.y) == TileType.Empty
+                             && !snap.objects.ContainsKey(c))
+                    .OrderBy(c => Manhattan(c, receiver))
+                    .ToList();
+
+                if (beamEmptyCells.Count == 0)
+                {
+                    Debug.LogWarning("[AI] S2: no empty cell on beam path. Falling to S3.");
+                    break;
+                }
+
+                // Pick off-beam object closest to the best beam cell
+                var offBeamObjects = allObjects
+                    .Where(c => !beam.pathSet.Contains(c))
+                    .ToList();
+
+                if (offBeamObjects.Count == 0) break;
+
+                Vector2Int bestTarget = beamEmptyCells[0];
+                Vector2Int bestSrc = offBeamObjects
+                    .OrderBy(c => Manhattan(c, bestTarget))
+                    .First();
+
+                // Get object type before picking up
+                TileType movedType = grid.GetTile(bestSrc.x, bestSrc.y);
+
+                Debug.Log($"[AI] S2 attempt {attempt + 1}: relocate {movedType}@{bestSrc} → {bestTarget}");
+
+                // Physical move: walk to source → pickup → walk to target → place
+                TeleportTo(bestSrc);
+                yield return new WaitForSeconds(fastWait);
+                GameObject held = PickupObject(bestSrc);
+                TotalPlacements++;
+                Relocations++;
+
+                TeleportTo(bestTarget);
+                yield return new WaitForSeconds(fastWait);
+
+                // Try each rotation at the new position
+                bool relocateSolved = false;
+                foreach (int rot in rots)
+                {
+                    PlaceObject(bestTarget, movedType, held, rot);
+                    yield return new WaitForSeconds(fastWait);
+
+                    if (RealSolved())
+                    {
+                        ExecutionTimeMs = (Time.realtimeSinceStartup - execStart) * 1000f;
+                        Debug.Log($"[AI] S2 solved! {movedType}@{bestTarget} rot={rot}°");
+                        Finish(true);
+                        yield return StartCoroutine(ExitDoor());
+                        relocateSolved = true;
+                        yield break;
+                    }
+                }
+
+                if (relocateSolved) yield break;
+
+                // Object is now on beam path — update allObjects list and re-run S1
+                allObjects.Remove(bestSrc);
+                allObjects.Add(bestTarget);
+                allObjects = allObjects.Distinct().ToList();
+
+                yield return StartCoroutine(SweepS1(allObjects, receiver, rots, fastWait));
+                if (RealSolved()) yield break;
+            }
+
+            // ── S3: exhaustive rotate-all (last resort) ───────────
+            if (!RealSolved())
+            {
+                // Cap object count to avoid spending minutes on unsolvable states
+                var s3Objects = allObjects.Take(MAX_S3_OBJECTS).ToList();
+                Debug.Log($"[AI] Sweep S3: exhaustive rotate on {s3Objects.Count} objects (cap={MAX_S3_OBJECTS}).");
+
+                foreach (var objCell in s3Objects)
+                {
+                    if (RealSolved()) break;
+                    TeleportTo(objCell);
+                    yield return new WaitForSeconds(fastWait);
+
+                    foreach (int rot in rots)
+                    {
+                        if (gridVisualizer.SpawnedObjects.TryGetValue(objCell, out var go) && go != null)
+                            go.transform.rotation = Quaternion.Euler(0f, rot, 0f);
+                        yield return new WaitForSeconds(fastWait);
+
+                        if (RealSolved())
+                        {
+                            ExecutionTimeMs = (Time.realtimeSinceStartup - execStart) * 1000f;
+                            Debug.Log($"[AI] S3 solved! rot={rot}°@{objCell}");
+                            Finish(true);
+                            yield return StartCoroutine(ExitDoor());
+                            yield break;
+                        }
+                    }
+                }
+            }
+
+            ExecutionTimeMs = (Time.realtimeSinceStartup - execStart) * 1000f;
+            if (!RealSolved())
+            {
+                Debug.LogWarning("[AI] All sweep stages failed.");
+                Finish(false);
+            }
+        }
+
+        // ── S1 helper: rotate on-beam objects (extracted for reuse by S2) ──
+        IEnumerator SweepS1(List<Vector2Int> allObjects,
+                            Vector2Int receiver,
+                            int[] rots,
+                            float fastWait)
+        {
+            for (int pass = 0; pass < 5 && !RealSolved(); pass++)
+            {
+                var beam = LogicalBeam(SnapshotGrid(), receiver);
+                var candidates = allObjects
+                    .Where(c => beam.pathSet.Contains(c))
+                    .OrderBy(c => Manhattan(c, receiver))
+                    .ToList();
+
+                if (candidates.Count == 0) yield break; // no on-beam objects — exit S1
+
+                bool improved = false;
+                foreach (var objCell in candidates)
+                {
+                    if (RealSolved()) yield break;
+                    TeleportTo(objCell);
+                    yield return new WaitForSeconds(fastWait);
+
+                    int baseScore = ScoreBeamLogical();
+                    foreach (int rot in rots)
+                    {
+                        if (gridVisualizer.SpawnedObjects.TryGetValue(objCell, out var go) && go != null)
+                            go.transform.rotation = Quaternion.Euler(0f, rot, 0f);
+                        yield return new WaitForSeconds(fastWait);
+
+                        if (RealSolved())
+                        {
+                            ExecutionTimeMs = (Time.realtimeSinceStartup - execStart) * 1000f;
+                            Debug.Log($"[AI] S1 solved! rot={rot}°@{objCell} pass={pass + 1}");
+                            Finish(true);
+                            yield return StartCoroutine(ExitDoor());
+                            yield break;
+                        }
+                        if (ScoreBeamLogical() > baseScore) { improved = true; break; }
+                    }
+                }
+                if (!improved) yield break;
+            }
+        }
+
+        // Score current beam using logical grid simulation.
+        int ScoreBeamLogical()
+        {
+            var receiver = FindFirst(TileType.Receiver);
+            var b = LogicalBeam(SnapshotGrid(), receiver);
+            if (b.hitReceiver) return int.MaxValue;
+            return b.path.Count - Manhattan(b.endCell, receiver) * 2;
+        }
+
+        // ════════════════════════════════════════════════════════════
+        // PHASE 2 — PHYSICAL EXECUTION
+        // ════════════════════════════════════════════════════════════
+        IEnumerator ExecutePlan(List<PlacementAction> plan)
+        {
+            Debug.Log($"[AI] Executing plan: {plan.Count} steps.");
+            var remaining = new List<PlacementAction>(plan);
+
+            while (remaining.Count > 0)
+            {
+                if (RealSolved()) break;
+
+                Vector2Int agentCell = WorldToGrid(transform.position);
+                int bestIdx = 0, bestDist = int.MaxValue;
+                for (int i = 0; i < remaining.Count; i++)
+                {
+                    int d = Manhattan(agentCell, remaining[i].SourceCell);
+                    if (d < bestDist) { bestDist = d; bestIdx = i; }
+                }
+
+                var action = remaining[bestIdx];
+                remaining.RemoveAt(bestIdx);
+                TotalPlacements++;
+
+                if (action.IsRotateOnly)
+                {
+                    InPlaceRotations++;
+                    Debug.Log($"[AI] Rotate {action.ObjType}@{action.TargetCell} → {action.Rotation}°");
+                    yield return StartCoroutine(WalkTo(action.TargetCell));
+                    if (gridVisualizer.SpawnedObjects.TryGetValue(action.TargetCell, out var goR) && goR != null)
+                        goR.transform.rotation = Quaternion.Euler(0f, action.Rotation, 0f);
+                    yield return new WaitForSeconds(physicsWait);
+                }
+                else
+                {
+                    Relocations++;
+                    Debug.Log($"[AI] Move {action.ObjType} {action.SourceCell}→{action.TargetCell} {action.Rotation}°");
+                    yield return StartCoroutine(WalkTo(action.SourceCell));
+                    yield return new WaitForSeconds(stepDelay);
+                    GameObject held = PickupObject(action.SourceCell);
+                    yield return StartCoroutine(WalkTo(action.TargetCell));
+                    PlaceObject(action.TargetCell, action.ObjType, held, action.Rotation);
+                    yield return new WaitForSeconds(physicsWait);
+                }
+            }
+
+            ExecutionTimeMs = (Time.realtimeSinceStartup - execStart) * 1000f;
+            yield return new WaitForSeconds(physicsWait * 2f);
+
+            if (RealSolved())
+            {
+                Debug.Log("[AI] Plan verified — SOLVED!");
+                Finish(true);
+                yield return StartCoroutine(ExitDoor());
+            }
+            else
+            {
+                Debug.LogWarning("[AI] Plan failed under physics — running sweep.");
+                SolvePhase = "Sweep";
+                yield return StartCoroutine(CorrectionSweep());
+            }
+        }
+
+        // ════════════════════════════════════════════════════════════
         // LOGICAL BEAM SIMULATION
-        // Pure logic — reads only from GridSnapshot + fixed grid tiles.
-        // Never touches GameObjects or Unity physics.
         // ════════════════════════════════════════════════════════════
         LogicalBeamResult LogicalBeam(GridSnapshot snap, Vector2Int receiver)
         {
@@ -514,7 +759,6 @@ namespace LightPCG.Systems
                                            LogicalBeamResult beam,
                                            Vector2Int receiver)
         {
-            // Tier 1: beam cells on same row/col as receiver with a clear line
             var t1 = beam.path
                 .Where(c => !snap.objects.ContainsKey(c) &&
                              grid.GetTile(c.x, c.y) == TileType.Empty &&
@@ -523,7 +767,6 @@ namespace LightPCG.Systems
                 .OrderBy(c => Manhattan(c, receiver)).ToList();
             if (t1.Count > 0) return t1;
 
-            // Tier 2: beam cells on receiver row/col (line may be blocked)
             var t2 = beam.path
                 .Where(c => !snap.objects.ContainsKey(c) &&
                              grid.GetTile(c.x, c.y) == TileType.Empty &&
@@ -531,7 +774,6 @@ namespace LightPCG.Systems
                 .OrderBy(c => Manhattan(c, receiver)).ToList();
             if (t2.Count > 0) return t2;
 
-            // Tier 3: any empty cell on receiver row/col
             var t3 = new List<Vector2Int>();
             for (int x = 1; x < grid.Width - 1; x++)
                 for (int y = 1; y < grid.Height - 1; y++)
@@ -544,7 +786,6 @@ namespace LightPCG.Systems
             t3 = t3.OrderBy(c => Manhattan(c, receiver)).ToList();
             if (t3.Count > 0) return t3;
 
-            // Tier 4: any non-occupied empty cell
             return Enumerable.Range(1, grid.Width - 2)
                 .SelectMany(x => Enumerable.Range(1, grid.Height - 2)
                     .Select(y => new Vector2Int(x, y)))
@@ -592,10 +833,6 @@ namespace LightPCG.Systems
             return dir;
         }
 
-        // ════════════════════════════════════════════════════════════
-        // DEFLECTION ROTATION SELECTOR
-        // Returns rotations sorted: correct deflection first.
-        // ════════════════════════════════════════════════════════════
         List<int> DeflectionRotationsForDir(TileType objType,
                                             Vector2Int inDir, Vector2Int toReceiver)
         {
@@ -643,16 +880,12 @@ namespace LightPCG.Systems
             return next;
         }
 
-        // Use an integer hash instead of string concatenation to reduce GC pressure.
-        // FNV-1a hash over sorted (x, y, type, rot) tuples — fast and collision-resistant
-        // enough for a transposition table of < 100k entries.
         int SnapshotHash(GridSnapshot snap)
         {
             var entries = new List<(int x, int y, int t, int r)>(snap.objects.Count);
             foreach (var kv in snap.objects)
                 entries.Add((kv.Key.x, kv.Key.y, (int)kv.Value.type, kv.Value.rot));
             entries.Sort((a, b) => a.x != b.x ? a.x - b.x : a.y != b.y ? a.y - b.y : 0);
-
             unchecked
             {
                 int hash = (int)2166136261;
@@ -676,191 +909,6 @@ namespace LightPCG.Systems
         }
 
         // ════════════════════════════════════════════════════════════
-        // PHASE 2 — PHYSICAL EXECUTION
-        //
-        // Execute the verified plan physically.
-        // Plan steps are sorted by proximity to the agent's current position
-        // to minimise total walking distance.
-        //
-        // In-place rotation: walk to cell, rotate — no pickup needed.
-        // Relocation:        walk to source, pickup, walk to target, place.
-        // ════════════════════════════════════════════════════════════
-        IEnumerator ExecutePlan(List<PlacementAction> plan)
-        {
-            Debug.Log($"[AI] Executing plan: {plan.Count} steps.");
-
-            // Sort steps by proximity to current agent position (greedy nearest-first)
-            // This avoids the bot running back and forth across the grid.
-            var remaining = new List<PlacementAction>(plan);
-
-            while (remaining.Count > 0)
-            {
-                if (RealSolved()) break;
-
-                // Pick the step whose source cell is closest to current agent position
-                Vector2Int agentCell = WorldToGrid(transform.position);
-                int bestIdx = 0;
-                int bestDist = int.MaxValue;
-                for (int i = 0; i < remaining.Count; i++)
-                {
-                    int d = Manhattan(agentCell, remaining[i].SourceCell);
-                    if (d < bestDist) { bestDist = d; bestIdx = i; }
-                }
-
-                var action = remaining[bestIdx];
-                remaining.RemoveAt(bestIdx);
-                TotalPlacements++;
-
-                if (action.IsRotateOnly)
-                {
-                    // In-place rotation: walk there and rotate the GameObject
-                    InPlaceRotations++;
-                    Debug.Log($"[AI] Rotate {action.ObjType}@{action.TargetCell} → {action.Rotation}°");
-                    yield return StartCoroutine(WalkTo(action.TargetCell));
-                    if (gridVisualizer.SpawnedObjects.TryGetValue(action.TargetCell, out var goR) && goR != null)
-                        goR.transform.rotation = Quaternion.Euler(0f, action.Rotation, 0f);
-                    yield return new WaitForSeconds(physicsWait);
-                }
-                else
-                {
-                    // Relocation: walk → pickup → walk → place
-                    Relocations++;
-                    Debug.Log($"[AI] Move {action.ObjType} {action.SourceCell}→{action.TargetCell} {action.Rotation}°");
-                    yield return StartCoroutine(WalkTo(action.SourceCell));
-                    yield return new WaitForSeconds(stepDelay);
-                    GameObject held = PickupObject(action.SourceCell);
-                    yield return StartCoroutine(WalkTo(action.TargetCell));
-                    PlaceObject(action.TargetCell, action.ObjType, held, action.Rotation);
-                    yield return new WaitForSeconds(physicsWait);
-                }
-            }
-
-            ExecutionTimeMs = (Time.realtimeSinceStartup - execStart) * 1000f;
-            yield return new WaitForSeconds(physicsWait * 2f);
-
-            if (RealSolved())
-            {
-                Debug.Log("[AI] Plan verified — SOLVED!");
-                Finish(true);
-                yield return StartCoroutine(ExitDoor());
-            }
-            else
-            {
-                Debug.LogWarning("[AI] Plan failed under physics — running sweep.");
-                SolvePhase = "Sweep";
-                yield return StartCoroutine(CorrectionSweep());
-            }
-        }
-
-        // ════════════════════════════════════════════════════════════
-        // CORRECTION SWEEP (last-resort fallback)
-        //
-        // S1 — Rotate on-beam objects only (fast, targeted):
-        //   Simulate beam → try all 8 rotations on objects the beam
-        //   currently passes through → re-simulate after each pass.
-        //   Stop early when no object improves the beam score.
-        //
-        // S3 — Rotate all objects (final fallback):
-        //   If S1 makes no progress, rotate every object including
-        //   off-beam ones to cover remaining edge cases.
-        // ════════════════════════════════════════════════════════════
-        IEnumerator CorrectionSweep()
-        {
-            float fastWait = Mathf.Min(physicsWait, 0.08f);
-            int[] rots = { 0, 45, 90, 135, 180, 225, 270, 315 };
-            var receiver = FindFirst(TileType.Receiver);
-
-            var allObjects = GetInteractables();
-            if (allObjects.Count == 0)
-            {
-                Debug.LogWarning("[AI] Sweep: no interactable objects.");
-                ExecutionTimeMs = (Time.realtimeSinceStartup - execStart) * 1000f;
-                Finish(RealSolved());
-                yield break;
-            }
-
-            // ── S1: rotate on-beam objects only ──
-            Debug.Log("[AI] Sweep S1: on-beam rotation.");
-            for (int pass = 0; pass < 5 && !RealSolved(); pass++)
-            {
-                var beam = LogicalBeam(SnapshotGrid(), receiver);
-                var candidates = allObjects
-                    .Where(c => beam.pathSet.Contains(c))
-                    .OrderBy(c => Manhattan(c, receiver))
-                    .ToList();
-
-                if (candidates.Count == 0) break;
-
-                bool improved = false;
-                foreach (var objCell in candidates)
-                {
-                    if (RealSolved()) break;
-                    TeleportTo(objCell);
-                    yield return new WaitForSeconds(fastWait);
-
-                    int baseScore = ScoreBeamLogical();
-                    foreach (int rot in rots)
-                    {
-                        if (gridVisualizer.SpawnedObjects.TryGetValue(objCell, out var go) && go != null)
-                            go.transform.rotation = Quaternion.Euler(0f, rot, 0f);
-                        yield return new WaitForSeconds(fastWait);
-
-                        if (RealSolved())
-                        {
-                            ExecutionTimeMs = (Time.realtimeSinceStartup - execStart) * 1000f;
-                            Debug.Log($"[AI] S1 solved! {rot}°@{objCell} pass={pass + 1}");
-                            Finish(true);
-                            yield return StartCoroutine(ExitDoor());
-                            yield break;
-                        }
-                        if (ScoreBeamLogical() > baseScore) { improved = true; break; }
-                    }
-                }
-                if (!improved) break;
-            }
-
-            // ── S3: rotate all objects (final fallback) ──
-            if (!RealSolved())
-            {
-                Debug.Log("[AI] Sweep S3: rotating all objects.");
-                foreach (var objCell in allObjects)
-                {
-                    if (RealSolved()) break;
-                    TeleportTo(objCell);
-                    yield return new WaitForSeconds(fastWait);
-
-                    foreach (int rot in rots)
-                    {
-                        if (gridVisualizer.SpawnedObjects.TryGetValue(objCell, out var go) && go != null)
-                            go.transform.rotation = Quaternion.Euler(0f, rot, 0f);
-                        yield return new WaitForSeconds(fastWait);
-
-                        if (RealSolved())
-                        {
-                            ExecutionTimeMs = (Time.realtimeSinceStartup - execStart) * 1000f;
-                            Debug.Log($"[AI] S3 solved! {rot}°@{objCell}");
-                            Finish(true);
-                            yield return StartCoroutine(ExitDoor());
-                            yield break;
-                        }
-                    }
-                }
-            }
-
-            ExecutionTimeMs = (Time.realtimeSinceStartup - execStart) * 1000f;
-            if (!RealSolved()) { Debug.LogWarning("[AI] All phases failed."); Finish(false); }
-        }
-
-        // Score current beam using logical grid simulation.
-        int ScoreBeamLogical()
-        {
-            var receiver = FindFirst(TileType.Receiver);
-            var b = LogicalBeam(SnapshotGrid(), receiver);
-            if (b.hitReceiver) return int.MaxValue;
-            return b.path.Count - Manhattan(b.endCell, receiver) * 2;
-        }
-
-        // ════════════════════════════════════════════════════════════
         // WALK TO / TELEPORT / BFS
         // ════════════════════════════════════════════════════════════
         IEnumerator WalkTo(Vector2Int target)
@@ -876,7 +924,7 @@ namespace LightPCG.Systems
             {
                 Vector3 dest = gridVisualizer.GridToWorld(step.x, step.y);
                 dest.y = transform.position.y;
-                float timeout = 3f; // reduced from 5f — stuck detection is faster
+                float timeout = 3f;
                 while (timeout > 0f)
                 {
                     timeout -= Time.deltaTime;
@@ -888,9 +936,6 @@ namespace LightPCG.Systems
                     cc.SimpleMove(delta.normalized * moveSpeed);
                     yield return null;
                 }
-
-                // If timeout expired the agent is stuck on a physics collider.
-                // Teleport directly to the step cell to recover.
                 if (timeout <= 0f)
                 {
                     Debug.LogWarning($"[AI] WalkTo stuck at step {step} — teleporting.");
@@ -899,7 +944,6 @@ namespace LightPCG.Systems
                 }
             }
 
-            // Final check: if still not close enough to target, teleport there directly.
             if (Vector3.Distance(transform.position, wt) > 0.5f)
             {
                 Debug.LogWarning($"[AI] WalkTo did not reach {target} — teleporting.");
@@ -932,11 +976,6 @@ namespace LightPCG.Systems
 
                     TileType t = grid.GetTile(next.x, next.y);
                     bool logicallyWalkable = (t == TileType.Empty || t == TileType.Door);
-
-                    // Also block cells that have a live physical object on them
-                    // (mirrors, refractors, etc.) unless it is the goal cell itself.
-                    // This prevents the CharacterController from getting stuck on
-                    // colliders that the logical grid considers passable.
                     bool hasPhysicalObject = next != goal &&
                         gridVisualizer.SpawnedObjects.TryGetValue(next, out var obj) &&
                         obj != null && obj.activeSelf;
@@ -1002,12 +1041,10 @@ namespace LightPCG.Systems
 
         Vector2Int RefractorDeflect(Vector2Int d, int rot)
         {
-            // rot = 0 หรือ 180 → ผ่านตรง (ตรงกับ Layer 1 ของ LaserSystem)
             if (Mathf.Abs(Mathf.DeltaAngle(rot, 0f)) <= 5f ||
                 Mathf.Abs(Mathf.DeltaAngle(rot, 180f)) <= 5f)
-                return d;  // pass-through
+                return d; // pass-through
 
-            // หมุนแล้ว → deflect (ตรงกับ Deflect90)
             return (Mathf.Abs(Mathf.DeltaAngle(rot, 90f)) < 45f ||
                     Mathf.Abs(Mathf.DeltaAngle(rot, 270f)) < 45f)
                 ? new Vector2Int(-d.y, d.x)
@@ -1040,20 +1077,16 @@ namespace LightPCG.Systems
         }
 
         // ════════════════════════════════════════════════════════════
-        // REAL LASER CHECK (Unity physics)
-        // Always re-validates the laser array to catch stale references
-        // from destroyed objects in previous levels.
+        // REAL LASER CHECK
         // ════════════════════════════════════════════════════════════
         bool RealSolved()
         {
-            // Remove stale (destroyed) references before checking
             if (allLasers != null)
             {
                 bool hasStale = false;
                 foreach (var l in allLasers) if (l == null) { hasStale = true; break; }
                 if (hasStale) allLasers = null;
             }
-
             if (allLasers == null || allLasers.Length == 0)
                 allLasers = FindLaserSystems();
             if (allLasers.Length == 0) return false;
