@@ -538,7 +538,7 @@ MonoBehaviour:
   receiverPrefab: {fileID: 2628894850650518270, guid: 06baf8e0f76ebfb4cb3d2be7177a0315, type: 3}
   mirrorPrefab: {fileID: 2628894850650518270, guid: 52cedb932d4490045b4057d3cbb58bbd, type: 3}
   doorPrefab: {fileID: 2628894850650518270, guid: 31801596b3528a24bb5100434713e41a, type: 3}
-  refractorPrefab: {fileID: 0}
+  refractorPrefab: {fileID: 7603299237096001433, guid: 8285b071a401ad44da3bcf55e86e37d4, type: 3}
   LastSolutionObjectCount: 0
   LastDecoyCount: 0
   LastTotalObjectCount: 0

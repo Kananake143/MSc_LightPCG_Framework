@@ -116,32 +116,14 @@ namespace LightPCG.Systems
         {
             Transform prism = hit.collider.transform;
 
-            // Layer 1: Rotation gate
-            float yRot = Mathf.DeltaAngle(0f, prism.eulerAngles.y);
+            // Layer 1 เท่านั้น: ถ้าไม่ถูกหมุน (yRot ≤ 5°) → ผ่านตรง
+            // ใช้ eulerAngles.y ตรงๆ แล้ว normalize เป็น 0–360
+            float yRot = prism.eulerAngles.y % 360f;
+            if (yRot > 180f) yRot -= 360f;   // map เป็น -180..180
             if (Mathf.Abs(yRot) <= 5f)
-                return inDir; // ไม่ถูกหมุน -> ผ่านตรง
+                return inDir;
 
-            // Layer 2: Face validity — dot(hit.normal, prism.forward) in XZ plane
-            Vector3 F = prism.forward; F.y = 0f;
-            if (F.sqrMagnitude < 0.001f) return inDir;
-            F.Normalize();
-
-            Vector3 N = hit.normal; N.y = 0f;
-            if (N.sqrMagnitude < 0.001f) return inDir;
-            N.Normalize();
-
-            // cos(60 deg) = 0.5 -> if normal is more than 60 deg away from forward = ridge = straight through
-            float faceDot = Mathf.Abs(Vector3.Dot(N, F));
-            if (faceDot < 0.5f)
-                return inDir; // Edge -> Pass straight
-
-            // Layer 3: Direction gate — Checks if the light is coming from a reasonable direction.
-            Vector3 inDirXZ = new Vector3(inDir.x, 0f, inDir.z).normalized;
-            float dirDot = Mathf.Abs(Vector3.Dot(inDirXZ, F));
-            if (dirDot <= 0.3f)
-                return inDir; // แสงเฉียงเกินไป -> ผ่านตรง
-
-            // Passing through all layers: Calculate a 90-degree refraction.
+            // หมุนแล้ว → deflect เสมอ (ตรงกับ RefractorDeflect ใน Solver)
             return Deflect90(inDir, prism);
         }
 

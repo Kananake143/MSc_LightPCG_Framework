@@ -1002,10 +1002,16 @@ namespace LightPCG.Systems
 
         Vector2Int RefractorDeflect(Vector2Int d, int rot)
         {
-            float a = rot;
-            return (Mathf.Abs(Mathf.DeltaAngle(a, 0f)) < 22.5f ||
-                    Mathf.Abs(Mathf.DeltaAngle(a, 180f)) < 22.5f)
-                ? new Vector2Int(-d.y, d.x) : new Vector2Int(d.y, -d.x);
+            // rot = 0 หรือ 180 → ผ่านตรง (ตรงกับ Layer 1 ของ LaserSystem)
+            if (Mathf.Abs(Mathf.DeltaAngle(rot, 0f)) <= 5f ||
+                Mathf.Abs(Mathf.DeltaAngle(rot, 180f)) <= 5f)
+                return d;  // pass-through
+
+            // หมุนแล้ว → deflect (ตรงกับ Deflect90)
+            return (Mathf.Abs(Mathf.DeltaAngle(rot, 90f)) < 45f ||
+                    Mathf.Abs(Mathf.DeltaAngle(rot, 270f)) < 45f)
+                ? new Vector2Int(-d.y, d.x)
+                : new Vector2Int(d.y, -d.x);
         }
 
         float GetYRot(Vector2Int cell)
