@@ -9,7 +9,7 @@ namespace LightPCG.Systems
         [Header("Laser Settings")]
         public float maxLaserDistance = 50f;
         public int maxBounces = 10;
-        [Tooltip("ตั้งเป็น Everything (-1) หรือ Layer ที่ puzzle objects อยู่")]
+        [Tooltip("Set Everything (-1) or Layer at puzzle objects ")]
         public LayerMask obstacleLayer = -1;
 
         [Header("Visual")]
@@ -116,8 +116,8 @@ namespace LightPCG.Systems
         {
             Transform prism = hit.collider.transform;
 
-            // Layer 1 เท่านั้น: ถ้าไม่ถูกหมุน (yRot ≤ 5°) → ผ่านตรง
-            // ใช้ eulerAngles.y ตรงๆ แล้ว normalize เป็น 0–360
+            // Layer 1 only: If not rotated (yRot ≤ 5°) → Direct pass
+            // Use eulerAngles.y directly and normalize to 0–360
             float yRot = prism.eulerAngles.y % 360f;
             if (yRot > 180f) yRot -= 360f;   // map เป็น -180..180
             if (Mathf.Abs(yRot) <= 5f)
