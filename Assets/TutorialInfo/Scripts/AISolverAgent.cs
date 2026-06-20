@@ -24,6 +24,23 @@ namespace LightPCG.Systems
     ///        ← replaces old S3 random-rotate-all which was unguided
     ///   S3 : Exhaustive rotate-all fallback (kept as last resort only)
     ///
+    /// SolvePhase values written out (used as the difficulty signal for RQ2):
+    ///   Trivial    — solved with no manipulation at all
+    ///   1A         — solved by rotation search only
+    ///   1B         — solved by beam-guided relocation search
+    ///   Sweep-S1   — Phase 1 search failed; solved by on-beam rotation fallback
+    ///   Sweep-S2   — solved only after relocating an object onto the beam first
+    ///   Sweep-S3   — solved only by exhaustive last-resort rotation
+    ///   Sweep      — entered the sweep fallback but never reached a solution
+    ///   None       — failed before/without ever entering the sweep
+    ///
+    /// NOTE: Sweep-S1/S2/S3 used to be collapsed into a single "Sweep" label,
+    /// which made it impossible to tell the difference between a puzzle that
+    /// needed one quick correction rotation and one that needed exhaustive
+    /// brute force. This distinction is added because RQ2's evaluation
+    /// depends on showing that harder (higher-MID) puzzles require deeper
+    /// solver stages — that signal was lost when all three were unified.
+    ///
     /// Key fix vs v3:
     ///   Old S3 rotated every object including decoys outside the beam,
     ///   which cannot redirect light and only wasted time or solved by accident.
@@ -59,6 +76,16 @@ namespace LightPCG.Systems
         [HideInInspector] public int InPlaceRotations;
         [HideInInspector] public int Relocations;
         [HideInInspector] public string SolvePhase = "None";
+
+        // ── Difficulty-signal stats (added for RQ2 sweep-stage tracking) ──
+        // These exist so BatchRunner can tell, for puzzles that fall back to
+        // CorrectionSweep, exactly how much extra work the solver needed and
+        // which sub-stage (S1/S2/S3) actually produced the solution. Without
+        // these, every Sweep-solved puzzle was indistinguishable in the CSV,
+        // which hid the difficulty signal exactly where it matters most.
+        [HideInInspector] public int SweepIterations;   // rotation/placement attempts made inside S1+S2+S3
+        [HideInInspector] public int SweepRelocations;  // relocations performed specifically by Sweep S2
+                                                        // (kept separate from Phase-1B's `Relocations` above)
 
         public System.Action<bool> OnSolveComplete;
 
@@ -136,6 +163,8 @@ namespace LightPCG.Systems
             SolveIterations = 0;
             SolveTimeMs = SearchTimeMs = ExecutionTimeMs = 0f;
             TotalPlacements = InPlaceRotations = Relocations = 0;
+            SweepIterations = 0;
+            SweepRelocations = 0;
             SolvePhase = "None";
             allLasers = null;
             _searchResult = null;
@@ -428,15 +457,15 @@ namespace LightPCG.Systems
         //   Only reached when S1 and S2 both fail. Limited to
         //   MAX_S3_OBJECTS to avoid spending minutes on unsolvable states.
         // ════════════════════════════════════════════════════════════
-        
-        
+
+
         IEnumerator CorrectionSweep()
         {
             int totalObjs = gridVisualizer.LastTotalObjectCount;
             int MAX_S2_RELOCATIONS = Mathf.Clamp(totalObjs / 3, 2, 6);
             int MAX_S3_OBJECTS = Mathf.Clamp(totalObjs, 4, 10);
 
-            
+
             float fastWait = Mathf.Min(physicsWait, 0.08f);
             int[] rots = { 0, 45, 90, 135, 180, 225, 270, 315 };
             Vector2Int receiver = FindFirst(TileType.Receiver);
@@ -502,6 +531,8 @@ namespace LightPCG.Systems
                 TileType movedType = grid.GetTile(bestSrc.x, bestSrc.y);
 
                 Debug.Log($"[AI] S2 attempt {attempt + 1}: relocate {movedType}@{bestSrc} → {bestTarget}");
+                SolveIterations++;
+                SweepIterations++;
 
                 // Physical move: walk to source → pickup → walk to target → place
                 TeleportTo(bestSrc);
@@ -509,6 +540,7 @@ namespace LightPCG.Systems
                 GameObject held = PickupObject(bestSrc);
                 TotalPlacements++;
                 Relocations++;
+                SweepRelocations++;
 
                 TeleportTo(bestTarget);
                 yield return new WaitForSeconds(fastWait);
@@ -517,12 +549,15 @@ namespace LightPCG.Systems
                 bool relocateSolved = false;
                 foreach (int rot in rots)
                 {
+                    SolveIterations++;
+                    SweepIterations++;
                     PlaceObject(bestTarget, movedType, held, rot);
                     yield return new WaitForSeconds(fastWait);
 
                     if (RealSolved())
                     {
                         ExecutionTimeMs = (Time.realtimeSinceStartup - execStart) * 1000f;
+                        SolvePhase = "Sweep-S2"; // solved via off-beam-object relocation
                         Debug.Log($"[AI] S2 solved! {movedType}@{bestTarget} rot={rot}°");
                         Finish(true);
                         yield return StartCoroutine(ExitDoor());
@@ -538,7 +573,9 @@ namespace LightPCG.Systems
                 allObjects.Add(bestTarget);
                 allObjects = allObjects.Distinct().ToList();
 
-                yield return StartCoroutine(SweepS1(allObjects, receiver, rots, fastWait));
+                // Label as Sweep-S2: the solution only became reachable because
+                // S2 moved an object onto the beam first.
+                yield return StartCoroutine(SweepS1(allObjects, receiver, rots, fastWait, "Sweep-S2"));
                 if (RealSolved()) yield break;
             }
 
@@ -557,6 +594,8 @@ namespace LightPCG.Systems
 
                     foreach (int rot in rots)
                     {
+                        SolveIterations++;
+                        SweepIterations++;
                         if (gridVisualizer.SpawnedObjects.TryGetValue(objCell, out var go) && go != null)
                             go.transform.rotation = Quaternion.Euler(0f, rot, 0f);
                         yield return new WaitForSeconds(fastWait);
@@ -564,6 +603,7 @@ namespace LightPCG.Systems
                         if (RealSolved())
                         {
                             ExecutionTimeMs = (Time.realtimeSinceStartup - execStart) * 1000f;
+                            SolvePhase = "Sweep-S3"; // last-resort exhaustive rotation
                             Debug.Log($"[AI] S3 solved! rot={rot}°@{objCell}");
                             Finish(true);
                             yield return StartCoroutine(ExitDoor());
@@ -582,10 +622,13 @@ namespace LightPCG.Systems
         }
 
         // ── S1 helper: rotate on-beam objects (extracted for reuse by S2) ──
+        // phaseLabel lets callers distinguish "pure S1" solves from solves that
+        // only became possible after S2 relocated an object onto the beam first.
         IEnumerator SweepS1(List<Vector2Int> allObjects,
                             Vector2Int receiver,
                             int[] rots,
-                            float fastWait)
+                            float fastWait,
+                            string phaseLabel = "Sweep-S1")
         {
             for (int pass = 0; pass < 5 && !RealSolved(); pass++)
             {
@@ -607,6 +650,8 @@ namespace LightPCG.Systems
                     int baseScore = ScoreBeamLogical();
                     foreach (int rot in rots)
                     {
+                        SolveIterations++;
+                        SweepIterations++;
                         if (gridVisualizer.SpawnedObjects.TryGetValue(objCell, out var go) && go != null)
                             go.transform.rotation = Quaternion.Euler(0f, rot, 0f);
                         yield return new WaitForSeconds(fastWait);
@@ -614,7 +659,8 @@ namespace LightPCG.Systems
                         if (RealSolved())
                         {
                             ExecutionTimeMs = (Time.realtimeSinceStartup - execStart) * 1000f;
-                            Debug.Log($"[AI] S1 solved! rot={rot}°@{objCell} pass={pass + 1}");
+                            SolvePhase = phaseLabel;
+                            Debug.Log($"[AI] S1 solved! rot={rot}°@{objCell} pass={pass + 1} ({phaseLabel})");
                             Finish(true);
                             yield return StartCoroutine(ExitDoor());
                             yield break;

@@ -22,6 +22,13 @@ namespace LightPCG.Research
     ///   α = 0.5  (path length — most influential)
     ///   β = 0.3  (rule variety)
     ///   γ = 0.2  (refractor complexity)
+    ///
+    /// SolvePhase column (RQ2 difficulty signal):
+    ///   Trivial / 1A / 1B / Sweep-S1 / Sweep-S2 / Sweep-S3 / Sweep(failed) / None,
+    ///   ordered roughly from least to most solver effort. SweepIterations and
+    ///   SweepRelocations give the effort actually spent once the solver fell
+    ///   back to CorrectionSweep, so harder (higher-MID) puzzles can be checked
+    ///   against deeper phases / higher effort, not just a pass/fail flag.
     /// </summary>
     public class BatchRunner : MonoBehaviour
     {
@@ -31,7 +38,7 @@ namespace LightPCG.Research
         private const float GAMMA = 0.2f;   // weight for Ci (Interaction Density)
 
         [Header("Experiment")]
-        public int totalRuns = 50;        // change to 1000 for full experiment
+        public int totalRuns = 1000;        // change to 1000 for full experiment
         public bool runOnStart = true;
 
         [Header("Progressive Difficulty")]
@@ -85,6 +92,12 @@ namespace LightPCG.Research
             // Execution performance (physical movement)
             public int totalPlacements, inPlaceRotations, relocations;
             public float execTimeMs;
+
+            // Sweep-stage effort (only non-zero when solvePhase starts with "Sweep")
+            // Added so RQ2 analysis can show how much extra work the solver
+            // needed once it fell back to CorrectionSweep, instead of just
+            // knowing "it used Sweep" with no sense of how hard that was.
+            public int sweepIterations, sweepRelocations;
 
             // Overall timing
             public float solveTimeMs, genMs;
@@ -213,6 +226,10 @@ namespace LightPCG.Research
                     relocations = solverAgent.Relocations,
                     execTimeMs = solverAgent.ExecutionTimeMs,
 
+                    // Sweep-stage effort
+                    sweepIterations = solverAgent.SweepIterations,
+                    sweepRelocations = solverAgent.SweepRelocations,
+
                     // Overall timing
                     solveTimeMs = solverAgent.SolveTimeMs,
                     genMs = gMs
@@ -257,6 +274,7 @@ namespace LightPCG.Research
                 "Solved,SolvePhase," +
                 "SearchNodes,SearchTimeMs," +
                 "TotalPlacements,InPlaceRotations,Relocations,ExecutionTimeMs," +
+                "SweepIterations,SweepRelocations," +
                 "SolveTimeMs,GenerationTimeMs");
 
             // ── Rows ──────────────────────────────────────────────────
@@ -269,6 +287,7 @@ namespace LightPCG.Research
                     $"{(r.solved ? 1 : 0)},{r.solvePhase}," +
                     $"{r.searchNodes},{r.searchTimeMs:F2}," +
                     $"{r.totalPlacements},{r.inPlaceRotations},{r.relocations},{r.execTimeMs:F2}," +
+                    $"{r.sweepIterations},{r.sweepRelocations}," +
                     $"{r.solveTimeMs:F2},{r.genMs:F2}");
 
             // ── Save ──────────────────────────────────────────────────
@@ -277,7 +296,8 @@ namespace LightPCG.Research
 
             // ── Summary log ───────────────────────────────────────────
             int solved2 = 0;
-            int p1a = 0, p1b = 0, sweep = 0, trivial = 0, none = 0;
+            int p1a = 0, p1b = 0, sweepS1 = 0, sweepS2 = 0, sweepS3 = 0, sweepFailed = 0,
+                trivial = 0, none = 0;
             float sumCl = 0f, sumCh = 0f, sumCi = 0f, sumMID = 0f;
 
             foreach (var r in records)
@@ -287,7 +307,10 @@ namespace LightPCG.Research
                 {
                     case "1A": p1a++; break;
                     case "1B": p1b++; break;
-                    case "Sweep": sweep++; break;
+                    case "Sweep-S1": sweepS1++; break;
+                    case "Sweep-S2": sweepS2++; break;
+                    case "Sweep-S3": sweepS3++; break;
+                    case "Sweep": sweepFailed++; break; // entered sweep but never solved
                     case "Trivial": trivial++; break;
                     default: none++; break;
                 }
@@ -301,7 +324,8 @@ namespace LightPCG.Research
             Debug.Log(
                 $"[Batch] ══ COMPLETE ══ {solved2}/{n} solved\n" +
                 $"  Phase breakdown — Trivial:{trivial} 1A:{p1a} 1B:{p1b} " +
-                $"Sweep:{sweep} Failed:{none}\n" +
+                $"Sweep-S1:{sweepS1} Sweep-S2:{sweepS2} Sweep-S3:{sweepS3} " +
+                $"SweepFailed:{sweepFailed} Failed:{none}\n" +
                 $"  MID averages — " +
                 $"Cl={sumCl / n:F4}  Ch={sumCh / n:F4}  Ci={sumCi / n:F4}  MID={sumMID / n:F4}\n" +
                 $"  CSV saved to: {path}");

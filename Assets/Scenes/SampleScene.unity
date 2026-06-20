@@ -543,6 +543,9 @@ MonoBehaviour:
   LastDecoyCount: 0
   LastTotalObjectCount: 0
   LastSteps: 0
+  LastMirrorCount: 0
+  LastRefractorCount: 0
+  LastRuleTransitions: 0
 --- !u!4 &1581782428
 Transform:
   m_ObjectHideFlags: 0
@@ -570,7 +573,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 6dda6ad5de5e7be45b99d5f8f79e549a, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  totalRuns: 50
+  totalRuns: 1000
   runOnStart: 1
   startSteps: 2
   maxSteps: 9
@@ -721,6 +724,8 @@ MonoBehaviour:
   InPlaceRotations: 0
   Relocations: 0
   SolvePhase: None
+  SweepIterations: 0
+  SweepRelocations: 0
 --- !u!143 &1901820499
 CharacterController:
   m_ObjectHideFlags: 0
@@ -758,7 +763,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 6dda6ad5de5e7be45b99d5f8f79e549a, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
-  totalRuns: 50
+  totalRuns: 1000
   runOnStart: 1
   startSteps: 2
   maxSteps: 9
