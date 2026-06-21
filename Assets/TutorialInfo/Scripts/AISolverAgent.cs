@@ -96,6 +96,12 @@ namespace LightPCG.Systems
         private LaserSystem[] allLasers;
         private float solveStart, searchStart, execStart;
         private bool running;
+        // Handle to the Phase-1 logical search coroutine. Needed so we can
+        // explicitly cancel it on timeout — without this, the search kept
+        // running in the background after Pipeline gave up waiting on it,
+        // racing with CorrectionSweep and corrupting SolveIterations /
+        // SolvePhase / SearchTimeMs for any puzzle that hit the 8s cap.
+        private Coroutine _searchCoroutine;
 
         private static readonly Vector2Int[] Dirs4 = {
             Vector2Int.right, Vector2Int.left,
@@ -169,6 +175,7 @@ namespace LightPCG.Systems
             allLasers = null;
             _searchResult = null;
             _searchDone = false;
+            _searchCoroutine = null; // StopAllCoroutines() above already killed any prior instance
             solveStart = searchStart = execStart = 0f;
 
             if (gridVisualizer != null)
@@ -217,14 +224,25 @@ namespace LightPCG.Systems
             searchStart = Time.realtimeSinceStartup;
             _searchResult = null;
             _searchDone = false;
-            StartCoroutine(RunSearchWithDoneFlag());
+            _searchCoroutine = StartCoroutine(RunSearchWithDoneFlag());
 
             float deadline = Time.realtimeSinceStartup + MAX_SEARCH_SECONDS;
             while (!_searchDone && Time.realtimeSinceStartup < deadline)
                 yield return null;
 
             if (!_searchDone)
+            {
+                // BUG FIX: previously the search coroutine was left running
+                // here. It kept incrementing SolveIterations and could even
+                // set SolvePhase to "1A"/"1B" minutes later, after
+                // CorrectionSweep had already finished and recorded its own
+                // (correct) Sweep-S1/S2/S3 result — silently overwriting it.
+                // Explicitly stop it so only CorrectionSweep's bookkeeping
+                // applies from this point on.
+                if (_searchCoroutine != null) StopCoroutine(_searchCoroutine);
+                _searchCoroutine = null;
                 Debug.LogWarning($"[AI] Search timeout after {MAX_SEARCH_SECONDS}s — going to sweep.");
+            }
 
             SearchTimeMs = (Time.realtimeSinceStartup - searchStart) * 1000f;
 

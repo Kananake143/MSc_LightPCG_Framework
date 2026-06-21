@@ -38,14 +38,24 @@ namespace LightPCG.Research
         private const float GAMMA = 0.2f;   // weight for Ci (Interaction Density)
 
         [Header("Experiment")]
-        public int totalRuns = 1000;        // change to 1000 for full experiment
+        public int totalRuns = 50;        // change to 1000 for full experiment
         public bool runOnStart = true;
 
-        [Header("Progressive Difficulty")]
+        [Header("Progressive Difficulty (legacy adaptive mode)")]
         public int startSteps = 2;
         public int maxSteps = 9;
         public int startDecoys = 0;
         public int decoyEveryN = 3;
+
+        [Header("Stratified Sampling")]
+        [Tooltip("If true, (Steps × Decoys) combinations are cycled through evenly across " +
+                 "totalRuns instead of ramping difficulty up adaptively. This is required for " +
+                 "the Low/Medium/High MID comparison in Section 3.4.2 — the adaptive mode " +
+                 "reaches max difficulty within ~10 runs and stays there, so 1000 adaptive " +
+                 "runs end up giving almost no coverage of the lower/medium tiers.")]
+        public bool useStratifiedSampling = true;
+        [Tooltip("Decoy counts to cycle through when stratified sampling is enabled.")]
+        public int[] decoyLevels = { 0, 1, 2, 3, 4 };
 
         [Header("References")]
         public GridVisualizer gridVisualizer;
@@ -116,9 +126,36 @@ namespace LightPCG.Research
         public void StartBatch() => StartCoroutine(RunBatch());
 
         // ════════════════════════════════════════════════════════════
+        // Returns the (steps, decoys) pair to use for the given zero-based
+        // run index. In stratified mode this is a deterministic round-robin
+        // over every (Steps × Decoys) combination so each tier gets roughly
+        // totalRuns / (stepsRange × decoyLevels.Length) samples — instead of
+        // the old adaptive mode, which raced to max difficulty in ~10 runs
+        // and spent the other 990+ runs stuck at a single tier.
+        // ════════════════════════════════════════════════════════════
+        (int steps, int decoys) GetDifficultyForRun(int zeroBasedIndex)
+        {
+            int stepsRange = Mathf.Max(1, maxSteps - startSteps + 1);
+            int decoyCount = (decoyLevels != null && decoyLevels.Length > 0) ? decoyLevels.Length : 1;
+
+            int stepsIdx = zeroBasedIndex % stepsRange;          // cycles fastest
+            int decoyIdx = (zeroBasedIndex / stepsRange) % decoyCount; // cycles slower
+
+            int steps = startSteps + stepsIdx;
+            int decoys = (decoyLevels != null && decoyLevels.Length > 0) ? decoyLevels[decoyIdx] : startDecoys;
+            return (steps, decoys);
+        }
+
+        // ════════════════════════════════════════════════════════════
         IEnumerator RunBatch()
         {
-            Debug.Log($"[Batch] Starting {totalRuns} runs | initialSteps={startSteps}");
+            int stepsRangeForLog = Mathf.Max(1, maxSteps - startSteps + 1);
+            int decoyCountForLog = (decoyLevels != null && decoyLevels.Length > 0) ? decoyLevels.Length : 1;
+            string modeMsg = useStratifiedSampling
+                ? $"stratified | {stepsRangeForLog} steps × {decoyCountForLog} decoy levels " +
+                  $"= {stepsRangeForLog * decoyCountForLog} tiers, ~{totalRuns / (stepsRangeForLog * decoyCountForLog)} runs/tier"
+                : $"adaptive | startSteps={startSteps}";
+            Debug.Log($"[Batch] Starting {totalRuns} runs | mode={modeMsg}");
             records.Clear();
             currentRun = 0;
             solvedInSession = 0;
@@ -128,6 +165,10 @@ namespace LightPCG.Research
                 currentRun = i + 1;
 
                 // Apply difficulty
+                if (useStratifiedSampling)
+                {
+                    (currentSteps, currentDecoys) = GetDifficultyForRun(i);
+                }
                 gridVisualizer.minSteps = currentSteps;
                 gridVisualizer.maxSteps = currentSteps;
                 gridVisualizer.decoyCount = currentDecoys;
@@ -235,13 +276,17 @@ namespace LightPCG.Research
                     genMs = gMs
                 });
 
-                // Update difficulty on success
+                // Update difficulty on success (legacy adaptive mode only —
+                // stratified mode already set steps/decoys deterministically above)
                 if (solved)
                 {
                     solvedInSession++;
-                    if (currentSteps < maxSteps) currentSteps++;
-                    currentDecoys = Mathf.Min(startDecoys + solvedInSession / decoyEveryN, 4);
-                    Debug.Log($"[Batch] Solved! Next steps={currentSteps} decoys={currentDecoys}");
+                    if (!useStratifiedSampling)
+                    {
+                        if (currentSteps < maxSteps) currentSteps++;
+                        currentDecoys = Mathf.Min(startDecoys + solvedInSession / decoyEveryN, 4);
+                        Debug.Log($"[Batch] Solved! Next steps={currentSteps} decoys={currentDecoys}");
+                    }
                 }
 
                 // Progress log every 10 runs
