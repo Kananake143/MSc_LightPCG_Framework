@@ -59,11 +59,78 @@
 
 
 
-**Next Steps:**
+## Week 3 (21–27 June 2026)
 
-* Utilize the data compiled in `PCG_Results.csv` to generate performance metrics visualizations, mapping out the correlation between level complexity and AI computation time.
-* Refine the implicit tutorial guidance mechanics by analyzing player onboarding flow relative to the generated layout complexities.
+### Research & Evaluation
+- Ran initial 1,000-run batch experiment using the existing
+  adaptive difficulty protocol; identified two critical issues
+  in the results: (1) difficulty tier coverage collapsed to a
+  single tier (Steps=9, Decoys=4) within ~10 runs, accounting
+  for 97.9% of all data, and (2) SearchTimeMs consistently
+  exceeded the intended 8-second cap due to an orphaned search
+  coroutine racing with CorrectionSweep after timeout.
 
+### Bug Fixes
+- **AISolverAgent.cs** — Fixed orphaned coroutine bug in
+  `Pipeline()`: stored the Phase-1 search coroutine handle in
+  `_searchCoroutine` and added an explicit `StopCoroutine()`
+  call on timeout, preventing the search from silently
+  overwriting `SolvePhase` and `SolveIterations` after
+  CorrectionSweep had already concluded.
+- **AISolverAgent.cs** — Added `SweepIterations` and
+  `SweepRelocations` fields to track solver effort inside
+  CorrectionSweep separately from Phase-1 search effort.
+- **AISolverAgent.cs** — Refined `SolvePhase` labels from a
+  single `"Sweep"` bucket into three distinct sub-stages:
+  `Sweep-S1` (on-beam rotation), `Sweep-S2` (off-beam
+  relocation), and `Sweep-S3` (exhaustive fallback), enabling
+  finer-grained difficulty signal analysis for RQ2.
+
+### Experimental Design Improvement
+- **BatchRunner.cs** — Replaced the adaptive progressive
+  difficulty protocol with a stratified sampling mode
+  (`useStratifiedSampling = true`): all 40 (Steps × Decoys)
+  tier combinations are now cycled deterministically, yielding
+  exactly 25 runs per tier across 1,000 total runs. This
+  ensures full difficulty-range coverage required for the
+  Low/Medium/High MID comparison described in Section 3.4.2.
+
+### Validated Experiment (N = 1,000, Stratified)
+- Re-ran the full 1,000-run batch with both fixes applied.
+- Overall solve rate: **55.6%** across all 40 difficulty tiers.
+- MID components now correlate positively with solver effort
+  (SweepIterations r ≈ 0.33–0.45; SolveTimeMs r ≈ 0.34–0.48)
+  and negatively with solve probability, consistent with the
+  design assumptions underlying the MID weighting scheme.
+- Cₗ (Linear Complexity) shows the strongest correlation with
+  solver effort among the three components across all three
+  effort measures, providing empirical post-hoc support for
+  the highest assigned weight (α = 0.5).
+
+### Advisor Meeting Preparation
+- Prepared 2-slide deck and one-page Q&A brief for Friday
+  advisor meeting addressing: "How does your bot tell us how
+  difficult a puzzle is?" with empirical evidence from the
+  validated 1,000-run dataset.
+
+### Next Steps
+- [ ] Incorporate section-insertion paragraphs into the full
+      manuscript Word document and send revised draft to advisor.
+- [ ] Produce expressive range analysis figures (Section 3.4.3):
+      scatter plot of generated puzzles in Cₗ×Cₕ feature space,
+      showing coverage and spread across difficulty tiers.
+- [ ] Reduce SearchTimeMs overshoot: lower `YIELD_EVERY` from
+      200 to ~20 inside `RotationSearch` so the 8-second deadline
+      check fires more frequently and timeout is respected tightly.
+      (121/1,000 runs currently exceed 8 s due to long yield
+      intervals — noted as a known limitation for now.)
+- [ ] Advisor meeting — Friday 27 June: answer "How does your
+      bot tell us how difficult a puzzle is?" and present
+      correlation results from the validated dataset.
+- [ ] Based on advisor feedback, finalise Limitations section
+      entries covering: (a) a priori MID weights not empirically
+      fitted, (b) SearchTimeMs overshoot, (c) human playtesting
+      deferred to future work.
 ## 🛠️ Technical Stack
 *   **Engine:** Unity 
 *   **Programming:** C# / Visual Studio 2022
