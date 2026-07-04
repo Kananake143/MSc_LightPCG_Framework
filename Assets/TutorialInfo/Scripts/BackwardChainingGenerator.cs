@@ -4,14 +4,16 @@ using System.Collections.Generic;
 namespace LightPCG.Core
 {
     /// <summary>
-    /// v15 — Refractor on solution path + MID metric support
+    /// v16 — แก้ไขสูตร Cl ให้ตรงกับรายงาน Section 3.4.3
     ///
-    /// Changes from v14:
-    ///   - BuildChain() now places Refractor (40% chance) when steps >= 4,
-    ///     enabling Rule Heterogeneity (Ch) on the solution path.
-    ///   - Tracks MirrorCount, RefractorCount, RuleTransitions per chain
-    ///     so BatchRunner can compute the full MID = αCl + βCh + γCi formula.
-    ///   - Pillar logic unchanged.
+    /// Changes from v15:
+    ///   - เพิ่ม property ClNumerator เพื่อให้ BatchRunner คำนวณ
+    ///     Cl = N_totalObjects / 256 ได้ถูกต้องตาม design intent ของรายงาน
+    ///     (N_totalObjects = SolutionObjects + Decoys รวมกัน)
+    ///   - ก่อนหน้า BatchRunner ใช้ SolutionObjectCount เพียงอย่างเดียว
+    ///     ทำให้ Cl ไม่รวม Decoys → ไม่ตรงกับ paper
+    ///   - แก้ Debug.Log ให้แสดง totalObjects ด้วย
+    ///   - BuildChain(), Pillar, Decoy logic ไม่มีการเปลี่ยนแปลง
     /// </summary>
     public class BackwardChainingGenerator
     {
@@ -25,7 +27,16 @@ namespace LightPCG.Core
         public int DecoyCount { get; private set; }
         public int TotalObjectCount => SolutionObjectCount + DecoyCount;
 
-        // ── NEW: MID component data (read by GridVisualizer → BatchRunner) ─
+        /// <summary>
+        /// ตัวเศษสำหรับคำนวณ Cl ตาม Section 3.4.3 ของรายงาน:
+        ///   Cl = N_totalObjects / 256
+        /// โดย N_totalObjects = SolutionObjects + Decoys (รวมทุก object บน grid)
+        /// BatchRunner ควรใช้ property นี้แทน SolutionObjectCount
+        /// เพื่อให้ Cl สะท้อน visual density ของ layout ทั้งหมด ไม่ใช่แค่ solution path
+        /// </summary>
+        public int ClNumerator => TotalObjectCount;   // = SolutionObjectCount + DecoyCount
+
+        // ── MID component data (read by GridVisualizer → BatchRunner) ────────
         /// <summary>Number of Mirror objects placed on the solution path.</summary>
         public int MirrorCount { get; private set; }
 
@@ -91,9 +102,10 @@ namespace LightPCG.Core
             PlacePillars(steps);
 
             Debug.Log($"[PCG] door@{door} recv@{recv} steps={steps} " +
-                      $"solutionObjs={SolutionObjectCount} " +
+                      $"solutionObjs={SolutionObjectCount} decoys={DecoyCount} " +
+                      $"totalObjs={TotalObjectCount} (ClNumerator={ClNumerator}) " +
                       $"mirrors={MirrorCount} refractors={RefractorCount} " +
-                      $"ruleTransitions={RuleTransitions} decoys={DecoyCount}");
+                      $"ruleTransitions={RuleTransitions}");
         }
 
         // ════════════════════════════════════════════════════════════

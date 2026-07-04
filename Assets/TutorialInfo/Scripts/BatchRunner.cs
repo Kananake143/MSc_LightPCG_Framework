@@ -15,7 +15,9 @@ namespace LightPCG.Research
     /// MID formula (Section 3.3 of paper):
     ///   MID = α·Cl + β·Ch + γ·Ci
     ///
-    ///   Cl  = Linear Complexity    = SolutionObjects / (GridWidth × GridHeight)
+    ///   Cl  = Component Density    = TotalObjects / (GridWidth × GridHeight)
+    ///                                 (TotalObjects = SolutionObjects + Decoys)
+    ///                                 ตาม Section 3.4.3 ของรายงาน: Cl = N_totalObjects / 256
     ///   Ch  = Rule Heterogeneity   = RuleTransitions / (SolutionObjects − 1)
     ///   Ci  = Interaction Density  = RefractorCount  /  SolutionObjects
     ///
@@ -33,7 +35,7 @@ namespace LightPCG.Research
     public class BatchRunner : MonoBehaviour
     {
         // ── MID weighting constants (paper Section 3.3) ───────────────
-        private const float ALPHA = 0.5f;   // weight for Cl (Linear Complexity)
+        private const float ALPHA = 0.5f;   // weight for Cl (Component Density)
         private const float BETA = 0.3f;   // weight for Ch (Rule Heterogeneity)
         private const float GAMMA = 0.2f;   // weight for Ci (Interaction Density)
 
@@ -86,9 +88,9 @@ namespace LightPCG.Research
             public int ruleTransitions, decoys, totalObjs, gridWidth, gridHeight;
 
             // MID components (paper Section 3.3)
-            public float Cl;    // Linear Complexity
-            public float Ch;    // Rule Heterogeneity
-            public float Ci;    // Interaction Density
+            public float Cl;    // Component Density       = TotalObjects / 256
+            public float Ch;    // Rule Heterogeneity      = RuleTransitions / (SolutionObjects - 1)
+            public float Ci;    // Component Complexity    = Refractors / SolutionObjects
             public float MID;   // Composite score = α·Cl + β·Ch + γ·Ci
 
             // Solver outcome
@@ -202,12 +204,15 @@ namespace LightPCG.Research
                 int refractorCount = gridVisualizer.LastRefractorCount;
                 int ruleTransitions = gridVisualizer.LastRuleTransitions;
 
-                // ── MID Calculation (paper Section 3.3) ──────────────
+                // ── MID Calculation (paper Section 3.4.3) ────────────
                 //
-                // Cl = Linear Complexity
-                //      Normalised interaction count: how "full" the solution path is
-                //      relative to the total grid area.
-                float Cl = (float)solObjs / (gw * gh);
+                // Cl = Component Density
+                //      สัดส่วนของ object ทั้งหมดบน grid (รวม Decoys) เทียบกับพื้นที่ grid
+                //      = N_totalObjects / 256  ตามรายงาน Section 3.4.3
+                //      ใช้ TotalObjects (SolutionObjects + Decoys) เพื่อ reflect
+                //      visual density ที่ผู้เล่นมองเห็นจริง ไม่ใช่แค่ solution path
+                int totalObjs = gridVisualizer.LastTotalObjectCount;
+                float Cl = (float)totalObjs / (gw * gh);
 
                 // Ch = Rule Heterogeneity
                 //      Fraction of consecutive bend pairs that switch mechanic type.
@@ -243,7 +248,7 @@ namespace LightPCG.Research
                     refractorCount = refractorCount,
                     ruleTransitions = ruleTransitions,
                     decoys = gridVisualizer.LastDecoyCount,
-                    totalObjs = gridVisualizer.LastTotalObjectCount,
+                    totalObjs = totalObjs,   // = SolutionObjects + Decoys (ใช้ตัวแปรที่ declare ไว้แล้วข้างบน)
                     gridWidth = gw,
                     gridHeight = gh,
 
