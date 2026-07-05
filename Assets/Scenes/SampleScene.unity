@@ -575,10 +575,12 @@ MonoBehaviour:
   m_EditorClassIdentifier: 
   totalRuns: 1000
   runOnStart: 1
-  startSteps: 2
+  startSteps: 3
   maxSteps: 9
   startDecoys: 0
   decoyEveryN: 3
+  useStratifiedSampling: 1
+  decoyLevels: 0000000001000000020000000300000004000000
   gridVisualizer: {fileID: 0}
   solverAgent: {fileID: 0}
   csvFileName: PCG_Results.csv
@@ -765,10 +767,12 @@ MonoBehaviour:
   m_EditorClassIdentifier: 
   totalRuns: 1000
   runOnStart: 1
-  startSteps: 2
+  startSteps: 3
   maxSteps: 9
   startDecoys: 0
   decoyEveryN: 3
+  useStratifiedSampling: 1
+  decoyLevels: 0000000001000000020000000300000004000000
   gridVisualizer: {fileID: 0}
   solverAgent: {fileID: 0}
   csvFileName: PCG_Results.csv

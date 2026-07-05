@@ -44,7 +44,7 @@ namespace LightPCG.Research
         public bool runOnStart = true;
 
         [Header("Progressive Difficulty (legacy adaptive mode)")]
-        public int startSteps = 2;
+        public int startSteps = 3;
         public int maxSteps = 9;
         public int startDecoys = 0;
         public int decoyEveryN = 3;
