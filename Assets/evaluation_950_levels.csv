@@ -1,3 +1,4 @@
+Run,Level,Steps,SolutionObjects,Mirrors,Refractors,RuleTransitions,Decoys,TotalObjects,GridWidth,GridHeight,Cl,Ch,Ci,MID,Solved,SolvePhase,SearchNodes,SearchTimeMs,TotalPlacements,InPlaceRotations,Relocations,ExecutionTimeMs,SweepIterations,SweepRelocations,Solve Time (×1000 ms),GenerationTimeMs
 51,25,4,3,2,1,1,2,5,16,16,0.0195,0.5,0.3333,0.2264,0,Sweep,746,941.16,1,0,1,6162.23,65,1,7409.55,10.74
 52,25,5,3,2,1,2,2,5,16,16,0.0195,1,0.3333,0.3764,0,Sweep,33538,9642.33,0,0,0,10910.4,57,0,20859.62,10.13
 53,25,6,5,3,2,2,2,7,16,16,0.0273,0.5,0.4,0.2437,0,1A,263352,8005.98,0,0,0,9945.19,102,0,18254.39,9.89

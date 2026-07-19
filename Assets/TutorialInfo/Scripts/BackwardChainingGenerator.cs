@@ -4,16 +4,12 @@ using System.Collections.Generic;
 namespace LightPCG.Core
 {
     /// <summary>
-    /// v16 — แก้ไขสูตร Cl ให้ตรงกับรายงาน Section 3.4.3
+    /// v16 —improve Cl
     ///
     /// Changes from v15:
-    ///   - เพิ่ม property ClNumerator เพื่อให้ BatchRunner คำนวณ
-    ///     Cl = N_totalObjects / 256 ได้ถูกต้องตาม design intent ของรายงาน
-    ///     (N_totalObjects = SolutionObjects + Decoys รวมกัน)
-    ///   - ก่อนหน้า BatchRunner ใช้ SolutionObjectCount เพียงอย่างเดียว
-    ///     ทำให้ Cl ไม่รวม Decoys → ไม่ตรงกับ paper
-    ///   - แก้ Debug.Log ให้แสดง totalObjects ด้วย
-    ///   - BuildChain(), Pillar, Decoy logic ไม่มีการเปลี่ยนแปลง
+    ///   - add property ClNumerator 
+    ///     Cl = N_totalObjects / 256 
+    ///     (N_totalObjects = SolutionObjects + Decoys )
     /// </summary>
     public class BackwardChainingGenerator
     {
@@ -28,11 +24,10 @@ namespace LightPCG.Core
         public int TotalObjectCount => SolutionObjectCount + DecoyCount;
 
         /// <summary>
-        /// ตัวเศษสำหรับคำนวณ Cl ตาม Section 3.4.3 ของรายงาน:
         ///   Cl = N_totalObjects / 256
-        /// โดย N_totalObjects = SolutionObjects + Decoys (รวมทุก object บน grid)
-        /// BatchRunner ควรใช้ property นี้แทน SolutionObjectCount
-        /// เพื่อให้ Cl สะท้อน visual density ของ layout ทั้งหมด ไม่ใช่แค่ solution path
+        ///  N_totalObjects = SolutionObjects + Decoys (all object on grid)
+        /// BatchRunner use property instead of SolutionObjectCount
+        /// Cl -> visual density of all layout
         /// </summary>
         public int ClNumerator => TotalObjectCount;   // = SolutionObjectCount + DecoyCount
 
