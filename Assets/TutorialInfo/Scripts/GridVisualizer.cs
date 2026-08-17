@@ -275,9 +275,15 @@ namespace LightPCG.Systems
         {
             foreach (var r in obj.GetComponentsInChildren<Renderer>())
             {
+                var mat = r.sharedMaterial;
                 var m = new MaterialPropertyBlock();
                 r.GetPropertyBlock(m);
-                m.SetColor("_Color", c);
+
+                if (mat != null && mat.HasProperty("_BaseColor"))
+                    m.SetColor("_BaseColor", c);   // URP / HDRP
+                if (mat != null && mat.HasProperty("_Color"))
+                    m.SetColor("_Color", c);       // Built-in RP
+
                 r.SetPropertyBlock(m);
             }
         }
@@ -303,7 +309,7 @@ namespace LightPCG.Systems
                 mat.SetFloat("_AlphaClip", 0f);
                 mat.EnableKeyword("_SURFACE_TYPE_TRANSPARENT");
                 mat.renderQueue = 3000;
-                Color c = mat.color; c.a = alpha; mat.color = c;
+                
                 var mpb = new MaterialPropertyBlock();
                 r.GetPropertyBlock(mpb);
                 mpb.SetColor("_BaseColor", new Color(0.88f, 0.96f, 1f, alpha));
