@@ -16,8 +16,7 @@ RUNNING THE APPLICATION
 
 1. Open Play folder.
 2. MSc_LightPCG_Framework.exe.
-3. The application will start automatically.
-4.Press Alt+F4 for exit
+3. The application will start automatically. (Press Alt+F4 for exit)
 
 APPLICATION OVERVIEW
 ========================================
